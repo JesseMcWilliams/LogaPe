@@ -44,8 +44,8 @@
     PrivateData = @{
         PSData = @{
             Tags       = @('Logging', 'Log', 'Logger', 'Mutex', 'ThreadSafe', 'Console')
-            LicenseUri = 'https://github.com/JesseMcWilliams/PowerShell-Logger/blob/main/LICENSE'
-            ProjectUri = 'https://github.com/JesseMcWilliams/PowerShell-Logger'
+            LicenseUri = 'https://github.com/JesseMcWilliams/LogaPe/blob/main/LICENSE'
+            ProjectUri = 'https://github.com/JesseMcWilliams/LogaPe'
             ReleaseNotes = 'v0.3.0: Get-LoggerContent for reading/tailing log files, sink support (Add-LoggerEventLogSink/Get-LoggerSink/Remove-LoggerSink) for independent outputs like Windows Event Log. v0.2.0: log rotation/retention, independent console/file levels, opt-in native PowerShell stream output, JSON output format, exception-aware Write-Log, Remove-Logger for mutex cleanup. v0.1.0: initial Gallery-standard release with function-based API and active-logger support.'
         }
     }

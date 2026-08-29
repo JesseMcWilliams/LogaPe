@@ -1,4 +1,4 @@
-# PowerShell-Logger — Design Document
+# LogaPe — Design Document
 
 Status: **Implemented** (v0.1.0). See §10 for what shipped, including a folder-layout change
 and extra fixes discovered while building it.
