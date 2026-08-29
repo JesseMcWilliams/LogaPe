@@ -77,6 +77,10 @@ class LoggingObject
     hidden [string] $LoggingMutexName
     hidden [System.Threading.Mutex] $loggingMutex
     hidden [timespan] $Timeout
+    hidden [double] $MaxSizeMB = 0
+    hidden [bool] $RotateDaily = $false
+    hidden [int] $RetentionDays = 0
+    hidden [int] $MaxArchivedFiles = 0
 
     LoggingObject() {}
 
@@ -133,6 +137,105 @@ class LoggingObject
     [void]SetTimeOutSeconds([int]$TimeOutSeconds)
     {
         $this.Timeout = New-TimeSpan -Seconds $TimeOutSeconds
+    }
+
+    [void]SetRotation([double]$MaxSizeMB, [bool]$RotateDaily, [int]$RetentionDays, [int]$MaxArchivedFiles)
+    {
+        $this.MaxSizeMB = $MaxSizeMB
+        $this.RotateDaily = $RotateDaily
+        $this.RetentionDays = $RetentionDays
+        $this.MaxArchivedFiles = $MaxArchivedFiles
+    }
+
+    [hashtable]GetRotation()
+    {
+        return @{
+            MaxSizeMB        = $this.MaxSizeMB
+            RotateDaily      = $this.RotateDaily
+            RetentionDays    = $this.RetentionDays
+            MaxArchivedFiles = $this.MaxArchivedFiles
+        }
+    }
+
+    # Called with the mutex already held (from WriteFile), so concurrent writers never race
+    # to rotate the same file.
+    hidden [void]RotateIfNeeded()
+    {
+        if ($this.MaxSizeMB -le 0 -and -not $this.RotateDaily)
+        {
+            return
+        }
+
+        if (-not (Test-Path -LiteralPath $this.LoggingFile -PathType Leaf))
+        {
+            return
+        }
+
+        $file = Get-Item -LiteralPath $this.LoggingFile
+        $needsRotation = $false
+
+        if ($this.MaxSizeMB -gt 0 -and ($file.Length / 1MB) -ge $this.MaxSizeMB)
+        {
+            $needsRotation = $true
+        }
+
+        if ($this.RotateDaily -and $file.LastWriteTime.Date -lt (Get-Date).Date)
+        {
+            $needsRotation = $true
+        }
+
+        if (-not $needsRotation)
+        {
+            return
+        }
+
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($this.LoggingFile)
+        $extension = [System.IO.Path]::GetExtension($this.LoggingFile)
+        $folder = Split-Path -Parent $this.LoggingFile
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+
+        # Millisecond timestamps can still collide under fast, repeated rotation (e.g. a tiny
+        # -MaxSizeMB in a tight loop), so fall back to a numeric suffix rather than overwriting
+        # a previous archive.
+        $archiveName = '{0}.{1}{2}' -f $baseName, $stamp, $extension
+        $suffix = 1
+        while (Test-Path -LiteralPath (Join-Path $folder $archiveName))
+        {
+            $archiveName = '{0}.{1}-{2}{3}' -f $baseName, $stamp, $suffix, $extension
+            $suffix++
+        }
+
+        Rename-Item -LiteralPath $this.LoggingFile -NewName $archiveName -ErrorAction Stop
+
+        $this.PruneArchivedFiles($folder, $baseName, $extension)
+    }
+
+    hidden [void]PruneArchivedFiles([string]$Folder, [string]$BaseName, [string]$Extension)
+    {
+        if ($this.RetentionDays -le 0 -and $this.MaxArchivedFiles -le 0)
+        {
+            return
+        }
+
+        $pattern = "$BaseName.*$Extension"
+        $archived = Get-ChildItem -Path $Folder -Filter $pattern -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending
+
+        if ($this.RetentionDays -gt 0)
+        {
+            $cutoff = (Get-Date).AddDays(-$this.RetentionDays)
+            $expired = $archived | Where-Object { $_.LastWriteTime -lt $cutoff }
+            if ($expired)
+            {
+                $expired | Remove-Item -Force -ErrorAction SilentlyContinue
+                $archived = $archived | Where-Object { $_.LastWriteTime -ge $cutoff }
+            }
+        }
+
+        if ($this.MaxArchivedFiles -gt 0 -and $archived.Count -gt $this.MaxArchivedFiles)
+        {
+            $archived | Select-Object -Skip $this.MaxArchivedFiles | Remove-Item -Force -ErrorAction SilentlyContinue
+        }
     }
 
     [void]WriteConsole([string]$Message, [LoggingLevel]$Level)
@@ -196,6 +299,8 @@ class LoggingObject
                 }
             }
 
+            $this.RotateIfNeeded()
+
             while ($true)
             {
                 if (-not (Test-IsFileLocked -Path $this.LoggingFile))
@@ -233,21 +338,35 @@ class LoggingObject
             }
         }
     }
+
+    [void]Dispose()
+    {
+        if ($this.loggingMutex)
+        {
+            $this.loggingMutex.Dispose()
+        }
+    }
 }
 
 class Logger
 {
-    hidden [LoggingLevel] $TargetLogLevel
+    hidden [LoggingLevel] $ConsoleLevel
+    hidden [LoggingLevel] $FileLevel
     hidden [LoggingObject] $LogFileObj
     hidden [string] $LogFileName
     hidden [string] $LogFilePath
     hidden [int] $TimeOut
+    hidden [string] $OutputFormat = 'Text'
+    hidden [string] $MessageFormat = '{Timestamp} | {Level} | {Message}'
+    hidden [string] $TimestampFormat = 'yyyy-MM-dd HH:mm:ss'
+    hidden [bool] $UseNativeStreams = $false
 
     [LoggingDestination] $LogDestination
 
     Logger([string]$LevelName, [string]$FileName, [string]$FolderPath, [int]$TimeOutSeconds, [string]$Destination)
     {
-        $this.TargetLogLevel = [LoggingLevel]::new($LevelName)
+        $this.ConsoleLevel = [LoggingLevel]::new($LevelName)
+        $this.FileLevel = [LoggingLevel]::new($LevelName)
         $this.LogFileName = $FileName
         $this.LogFilePath = $FolderPath
         $this.TimeOut = $TimeOutSeconds
@@ -257,12 +376,88 @@ class Logger
 
     [void]SetLoggingLevel([LoggingLevel]$LoggingLevel)
     {
-        $this.TargetLogLevel = $LoggingLevel
+        $this.ConsoleLevel = $LoggingLevel
+        $this.FileLevel = $LoggingLevel
+    }
+
+    [void]SetConsoleLevel([LoggingLevel]$LoggingLevel)
+    {
+        $this.ConsoleLevel = $LoggingLevel
+    }
+
+    [void]SetFileLevel([LoggingLevel]$LoggingLevel)
+    {
+        $this.FileLevel = $LoggingLevel
     }
 
     [string]GetLoggingLevel()
     {
-        return $this.TargetLogLevel.Name()
+        return $this.ConsoleLevel.Name()
+    }
+
+    [string]GetConsoleLevel()
+    {
+        return $this.ConsoleLevel.Name()
+    }
+
+    [string]GetFileLevel()
+    {
+        return $this.FileLevel.Name()
+    }
+
+    [void]SetOutputFormat([string]$Format)
+    {
+        $this.OutputFormat = $Format
+    }
+
+    [string]GetOutputFormat()
+    {
+        return $this.OutputFormat
+    }
+
+    [void]SetMessageFormat([string]$Format)
+    {
+        $this.MessageFormat = $Format
+    }
+
+    [string]GetMessageFormat()
+    {
+        return $this.MessageFormat
+    }
+
+    [void]SetTimestampFormat([string]$Format)
+    {
+        $this.TimestampFormat = $Format
+    }
+
+    [string]GetTimestampFormat()
+    {
+        return $this.TimestampFormat
+    }
+
+    [void]SetUseNativeStreams([bool]$Value)
+    {
+        $this.UseNativeStreams = $Value
+    }
+
+    [bool]GetUseNativeStreams()
+    {
+        return $this.UseNativeStreams
+    }
+
+    [void]SetRotation([double]$MaxSizeMB, [bool]$RotateDaily, [int]$RetentionDays, [int]$MaxArchivedFiles)
+    {
+        $this.LogFileObj.SetRotation($MaxSizeMB, $RotateDaily, $RetentionDays, $MaxArchivedFiles)
+    }
+
+    [hashtable]GetRotation()
+    {
+        return $this.LogFileObj.GetRotation()
+    }
+
+    [void]Close()
+    {
+        $this.LogFileObj.Dispose()
     }
 
     [void]SetLoggingPath([string]$FolderPath)
@@ -328,57 +523,145 @@ class Logger
 
     [string]ToString()
     {
-        return "`r`n`tLevel        | $($this.TargetLogLevel.Name())" +
+        return "`r`n`tConsoleLevel | $($this.ConsoleLevel.Name())" +
+               "`r`n`tFileLevel    | $($this.FileLevel.Name())" +
                "`r`n`tFileName     | $($this.LogFileName)" +
                "`r`n`tPath         | $($this.LogFilePath)" +
                "`r`n`tDestination  | $($this.LogDestination.LogDestination)" +
+               "`r`n`tOutputFormat | $($this.OutputFormat)" +
                "`r`n`tMutexName    | $($this.LogFileObj.GetLoggingMutexName())"
     }
 
-    # Method overloads collapse onto the 4-argument form so the level-filter check and the
+    # Method overloads collapse onto the 5-argument form so the level-filter check and the
     # write path each exist in exactly one place.
     [void]Write([string]$Message)
     {
-        $this.Write($Message, [LoggingLevel]::new('Information'), $this.LogDestination, $false)
+        $this.Write($Message, [LoggingLevel]::new('Information'), $this.LogDestination, $false, $null)
     }
 
     [void]Write([string]$Message, [LoggingLevel]$Level)
     {
-        $this.Write($Message, $Level, $this.LogDestination, $false)
+        $this.Write($Message, $Level, $this.LogDestination, $false, $null)
     }
 
     [void]Write([string]$Message, [LoggingLevel]$Level, [LoggingDestination]$Destination)
     {
-        $this.Write($Message, $Level, $Destination, $false)
+        $this.Write($Message, $Level, $Destination, $false, $null)
     }
 
     [void]Write([string]$Message, [LoggingLevel]$Level, [LoggingDestination]$Destination, [bool]$Bare)
     {
-        if ($this.TargetLogLevel.Level() -le $Level.Level())
+        $this.Write($Message, $Level, $Destination, $Bare, $null)
+    }
+
+    [void]Write([string]$Message, [LoggingLevel]$Level, [LoggingDestination]$Destination, [bool]$Bare, [hashtable]$Fields)
+    {
+        $writeConsole = $Destination.Console() -and ($this.ConsoleLevel.Level() -le $Level.Level())
+        $writeFile = $Destination.File() -and ($this.FileLevel.Level() -le $Level.Level())
+
+        if (-not $writeConsole -and -not $writeFile)
         {
-            $this._WriteOutput($Message, $Level, $Destination, $Bare)
+            return
+        }
+
+        $this._WriteOutput($Message, $Level, $writeConsole, $writeFile, $Bare, $Fields)
+    }
+
+    hidden [void]_WriteOutput([string]$Message, [LoggingLevel]$Level, [bool]$WriteConsole, [bool]$WriteFile, [bool]$Bare, [hashtable]$Fields)
+    {
+        $formatted = $this.FormatMessage($Message, $Level, $Bare, $Fields)
+
+        if ($WriteConsole)
+        {
+            if ($this.UseNativeStreams)
+            {
+                $this.WriteNativeStream($formatted, $Level)
+            }
+            else
+            {
+                $this.LogFileObj.WriteConsole($formatted, $Level)
+            }
+        }
+
+        if ($WriteFile)
+        {
+            $this.LogFileObj.WriteFile($formatted)
         }
     }
 
-    hidden [void]_WriteOutput([string]$Message, [LoggingLevel]$Level, [LoggingDestination]$Destination, [bool]$Bare)
+    hidden [string]FormatMessage([string]$Message, [LoggingLevel]$Level, [bool]$Bare, [hashtable]$Fields)
     {
+        if ($this.OutputFormat -eq 'Json')
+        {
+            $record = [ordered]@{}
+            if (-not $Bare)
+            {
+                $record['Timestamp'] = Get-Date -Format $this.TimestampFormat
+                $record['Level'] = $Level.Name()
+            }
+            $record['Message'] = $Message
+
+            if ($Fields)
+            {
+                foreach ($key in $Fields.Keys)
+                {
+                    $record[$key] = $Fields[$key]
+                }
+            }
+
+            return ($record | ConvertTo-Json -Compress)
+        }
+
         if ($Bare)
         {
-            $writeString = $Message
+            $text = $Message
         }
         else
         {
-            $writeString = '{0} | {1} | {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level.Name().PadLeft(11, ' '), $Message
+            $text = $this.MessageFormat.
+                Replace('{Timestamp}', (Get-Date -Format $this.TimestampFormat)).
+                Replace('{Level}', $Level.Name().PadLeft(11, ' ')).
+                Replace('{Message}', $Message)
         }
 
-        if ($Destination.Console())
+        if ($Fields)
         {
-            $this.LogFileObj.WriteConsole($writeString, $Level)
+            $fieldText = ($Fields.Keys | ForEach-Object { "$_=$($Fields[$_])" }) -join ', '
+            $text = "$text | $fieldText"
         }
 
-        if ($Destination.File())
+        return $text
+    }
+
+    # Emits through PowerShell's real Warning/Error/Verbose/Debug/Information streams instead
+    # of colored Write-Host, so -WarningAction/-ErrorAction/$WarningPreference/transcripts see
+    # it. There is no native stream for Critical, so it's emitted as an Error with a prefix.
+    hidden [void]WriteNativeStream([string]$FormattedMessage, [LoggingLevel]$Level)
+    {
+        $levelName = $Level.Name()
+        if ($levelName -eq 'Trace' -or $levelName -eq 'Verbose')
         {
-            $this.LogFileObj.WriteFile($writeString)
+            Write-Verbose $FormattedMessage
+        }
+        elseif ($levelName -eq 'Debug')
+        {
+            Write-Debug $FormattedMessage
+        }
+        elseif ($levelName -eq 'Warning')
+        {
+            Write-Warning $FormattedMessage
+        }
+        elseif ($levelName -eq 'Error')
+        {
+            Write-Error $FormattedMessage
+        }
+        elseif ($levelName -eq 'Critical')
+        {
+            Write-Error "[CRITICAL] $FormattedMessage"
+        }
+        else
+        {
+            Write-Information $FormattedMessage
         }
     }
 }
@@ -608,20 +891,54 @@ function Get-LoggerLevel
     .SYNOPSIS
     Gets a logger's minimum logging level.
 
+    .DESCRIPTION
+    Console and file can be configured at different levels (see Set-LoggerLevel -Destination).
+    With -Destination Both (the default), this returns a single string when both destinations
+    share the same level, or a [pscustomobject] with Console/File properties when they differ.
+
+    .PARAMETER Destination
+    Which destination's level to return: 'Console', 'File', or 'Both' (default).
+
     .PARAMETER Logger
     The Logger instance to query. Defaults to the active logger.
 
     .OUTPUTS
-    System.String
+    System.String, or a [pscustomobject] with Console/File properties when they differ and
+    -Destination Both was used.
     #>
     [CmdletBinding()]
-    [OutputType([string])]
     param(
         [Parameter(Position = 0)]
+        [ValidateSet('Console', 'File', 'Both')]
+        [string]$Destination = 'Both',
+
+        [Parameter()]
         [Logger]$Logger
     )
 
-    (Resolve-TargetLogger -Logger $Logger).GetLoggingLevel()
+    $target = Resolve-TargetLogger -Logger $Logger
+
+    if ($Destination -eq 'Console')
+    {
+        return $target.GetConsoleLevel()
+    }
+
+    if ($Destination -eq 'File')
+    {
+        return $target.GetFileLevel()
+    }
+
+    $consoleLevel = $target.GetConsoleLevel()
+    $fileLevel = $target.GetFileLevel()
+    if ($consoleLevel -eq $fileLevel)
+    {
+        return $consoleLevel
+    }
+
+    return [pscustomobject]@{
+        Console = $consoleLevel
+        File    = $fileLevel
+    }
 }
 
 function Get-LoggerPath
@@ -712,9 +1029,47 @@ function New-Logger
     Make this the module's active logger, so Write-Log and the Get-/Set-Logger* functions can
     be called without passing -Logger explicitly.
 
+    .PARAMETER MaxSizeMB
+    Roll the log file over once it reaches this size, in megabytes. 0 (default) disables
+    size-based rotation. Can be combined with -RotateDaily.
+
+    .PARAMETER RotateDaily
+    Roll the log file over the first time it's written to on a new calendar day.
+
+    .PARAMETER RetentionDays
+    Delete rolled-over (archived) log files older than this many days. 0 (default) disables
+    age-based cleanup. Only affects archived files, never the current log file.
+
+    .PARAMETER MaxArchivedFiles
+    Keep at most this many rolled-over (archived) log files, deleting the oldest first once
+    exceeded. 0 (default) disables count-based cleanup.
+
+    .PARAMETER OutputFormat
+    'Text' (default) writes human-readable lines. 'Json' writes one JSON object per line
+    (Timestamp, Level, Message, plus any -Fields passed to Write-Log) to every active
+    destination, including the console.
+
+    .PARAMETER MessageFormat
+    Template for 'Text' output. Supports {Timestamp}, {Level}, {Message} tokens. Defaults to
+    '{Timestamp} | {Level} | {Message}'. Ignored in 'Json' mode and by -Bare writes.
+
+    .PARAMETER TimestampFormat
+    .NET date format string used for the {Timestamp} token and the Json 'Timestamp' field.
+    Defaults to 'yyyy-MM-dd HH:mm:ss'.
+
+    .PARAMETER UseNativeStreams
+    Route console output through PowerShell's real Write-Verbose/-Debug/-Warning/-Error/
+    -Information cmdlets (chosen by message level) instead of colored Write-Host. This makes
+    -WarningAction/-ErrorAction/$WarningPreference/transcripts see the messages, but Write-
+    Information is silent by default unless $InformationPreference/-InformationAction says
+    otherwise - that's native Write-Information behavior, not a bug.
+
     .EXAMPLE
     $logger = New-Logger -Level Verbose -Destination Both -SetActive
     Write-Log 'Hello world'
+
+    .EXAMPLE
+    New-Logger -Destination File -MaxSizeMB 10 -RetentionDays 30 -SetActive
 
     .OUTPUTS
     Logger
@@ -743,7 +1098,32 @@ function New-Logger
         [int]$TimeoutSeconds = 5,
 
         [Parameter()]
-        [switch]$SetActive
+        [switch]$SetActive,
+
+        [Parameter()]
+        [double]$MaxSizeMB = 0,
+
+        [Parameter()]
+        [switch]$RotateDaily,
+
+        [Parameter()]
+        [int]$RetentionDays = 0,
+
+        [Parameter()]
+        [int]$MaxArchivedFiles = 0,
+
+        [Parameter()]
+        [ValidateSet('Text', 'Json')]
+        [string]$OutputFormat = 'Text',
+
+        [Parameter()]
+        [string]$MessageFormat,
+
+        [Parameter()]
+        [string]$TimestampFormat,
+
+        [Parameter()]
+        [switch]$UseNativeStreams
     )
 
     $callerScript = (Get-PSCallStack)[1].ScriptName
@@ -780,6 +1160,28 @@ function New-Logger
     if ($PSCmdlet.ShouldProcess($fullPath, 'Create logger (and its file mutex)'))
     {
         $logger = [Logger]::new($Level, $FileName, $Folder, $TimeoutSeconds, $Destination)
+
+        if ($MaxSizeMB -gt 0 -or $RotateDaily -or $RetentionDays -gt 0 -or $MaxArchivedFiles -gt 0)
+        {
+            $logger.SetRotation($MaxSizeMB, $RotateDaily.IsPresent, $RetentionDays, $MaxArchivedFiles)
+        }
+
+        $logger.SetOutputFormat($OutputFormat)
+
+        if ($PSBoundParameters.ContainsKey('MessageFormat'))
+        {
+            $logger.SetMessageFormat($MessageFormat)
+        }
+
+        if ($PSBoundParameters.ContainsKey('TimestampFormat'))
+        {
+            $logger.SetTimestampFormat($TimestampFormat)
+        }
+
+        if ($UseNativeStreams)
+        {
+            $logger.SetUseNativeStreams($true)
+        }
 
         if ($SetActive -or (-not $script:ActiveLogger))
         {
@@ -893,14 +1295,27 @@ function Set-LoggerLevel
     .SYNOPSIS
     Sets a logger's minimum logging level.
 
+    .DESCRIPTION
+    Console and file can be filtered independently - e.g. a quiet console at Warning while the
+    file captures everything at Verbose - by calling this twice with different -Destination
+    values.
+
     .PARAMETER Level
     The new minimum level. Messages below this level will be filtered out.
+
+    .PARAMETER Destination
+    Which destination to apply this to: 'Console', 'File', or 'Both' (default - matches the
+    original single-level behavior).
 
     .PARAMETER Logger
     The Logger instance to update. Defaults to the active logger.
 
     .EXAMPLE
     Set-LoggerLevel -Level Debug
+
+    .EXAMPLE
+    Set-LoggerLevel -Level Warning -Destination Console
+    Set-LoggerLevel -Level Verbose -Destination File
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -908,14 +1323,26 @@ function Set-LoggerLevel
         [ValidateSet('None', 'Critical', 'Error', 'Warning', 'Information', 'Debug', 'Verbose', 'Trace')]
         [string]$Level,
 
+        [Parameter(Position = 1)]
+        [ValidateSet('Console', 'File', 'Both')]
+        [string]$Destination = 'Both',
+
         [Parameter()]
         [Logger]$Logger
     )
 
     $target = Resolve-TargetLogger -Logger $Logger
-    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Set level to '$Level'"))
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Set $Destination level to '$Level'"))
     {
-        $target.SetLoggingLevel([LoggingLevel]::new($Level))
+        $levelObj = [LoggingLevel]::new($Level)
+        if ($Destination -eq 'Console' -or $Destination -eq 'Both')
+        {
+            $target.SetConsoleLevel($levelObj)
+        }
+        if ($Destination -eq 'File' -or $Destination -eq 'Both')
+        {
+            $target.SetFileLevel($levelObj)
+        }
     }
 }
 
@@ -985,6 +1412,318 @@ function Set-LoggerTimeout
     }
 }
 
+function Get-LoggerRotation
+{
+    <#
+    .SYNOPSIS
+    Gets a logger's rotation and retention settings.
+
+    .PARAMETER Logger
+    The Logger instance to query. Defaults to the active logger.
+
+    .OUTPUTS
+    A [pscustomobject] with MaxSizeMB, RotateDaily, RetentionDays, and MaxArchivedFiles.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        [Logger]$Logger
+    )
+
+    [pscustomobject](Resolve-TargetLogger -Logger $Logger).GetRotation()
+}
+
+function Set-LoggerRotation
+{
+    <#
+    .SYNOPSIS
+    Configures a logger's rotation and retention settings.
+
+    .DESCRIPTION
+    Rotation is checked on each write (under the file mutex, so concurrent writers never race
+    to rotate the same file). Rolled-over files are named
+    '<name>.<yyyyMMdd-HHmmss><extension>' next to the active log file. Any parameter you omit
+    keeps its current value - this updates settings incrementally rather than requiring all
+    four every time.
+
+    .PARAMETER MaxSizeMB
+    Roll the file over once it reaches this size, in megabytes. 0 disables size-based rotation.
+
+    .PARAMETER RotateDaily
+    Roll the file over the first time it's written to on a new calendar day.
+
+    .PARAMETER RetentionDays
+    Delete archived files older than this many days. 0 disables age-based cleanup.
+
+    .PARAMETER MaxArchivedFiles
+    Keep at most this many archived files, deleting the oldest first. 0 disables count-based
+    cleanup.
+
+    .PARAMETER Logger
+    The Logger instance to update. Defaults to the active logger.
+
+    .EXAMPLE
+    Set-LoggerRotation -MaxSizeMB 10 -RetentionDays 30
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter()]
+        [double]$MaxSizeMB,
+
+        [Parameter()]
+        [bool]$RotateDaily,
+
+        [Parameter()]
+        [int]$RetentionDays,
+
+        [Parameter()]
+        [int]$MaxArchivedFiles,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    $current = $target.GetRotation()
+
+    $effectiveMaxSizeMB = if ($PSBoundParameters.ContainsKey('MaxSizeMB')) { $MaxSizeMB } else { $current.MaxSizeMB }
+    $effectiveRotateDaily = if ($PSBoundParameters.ContainsKey('RotateDaily')) { $RotateDaily } else { $current.RotateDaily }
+    $effectiveRetentionDays = if ($PSBoundParameters.ContainsKey('RetentionDays')) { $RetentionDays } else { $current.RetentionDays }
+    $effectiveMaxArchivedFiles = if ($PSBoundParameters.ContainsKey('MaxArchivedFiles')) { $MaxArchivedFiles } else { $current.MaxArchivedFiles }
+
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), 'Set rotation settings'))
+    {
+        $target.SetRotation($effectiveMaxSizeMB, $effectiveRotateDaily, $effectiveRetentionDays, $effectiveMaxArchivedFiles)
+    }
+}
+
+function Get-LoggerOutputFormat
+{
+    <#
+    .SYNOPSIS
+    Gets a logger's output format ('Text' or 'Json').
+
+    .PARAMETER Logger
+    The Logger instance to query. Defaults to the active logger.
+
+    .OUTPUTS
+    System.String
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Position = 0)]
+        [Logger]$Logger
+    )
+
+    (Resolve-TargetLogger -Logger $Logger).GetOutputFormat()
+}
+
+function Set-LoggerOutputFormat
+{
+    <#
+    .SYNOPSIS
+    Sets a logger's output format.
+
+    .DESCRIPTION
+    'Text' (default) writes human-readable lines using the logger's message format (see
+    Set-LoggerMessageFormat). 'Json' writes one JSON object per line (Timestamp, Level,
+    Message, plus any -Fields passed to Write-Log) to every active destination.
+
+    .PARAMETER Format
+    'Text' or 'Json'.
+
+    .PARAMETER Logger
+    The Logger instance to update. Defaults to the active logger.
+
+    .EXAMPLE
+    Set-LoggerOutputFormat -Format Json
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateSet('Text', 'Json')]
+        [string]$Format,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Set output format to '$Format'"))
+    {
+        $target.SetOutputFormat($Format)
+    }
+}
+
+function Get-LoggerMessageFormat
+{
+    <#
+    .SYNOPSIS
+    Gets a logger's text message template and timestamp format.
+
+    .PARAMETER Logger
+    The Logger instance to query. Defaults to the active logger.
+
+    .OUTPUTS
+    A [pscustomobject] with Format and TimestampFormat.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    [pscustomobject]@{
+        Format          = $target.GetMessageFormat()
+        TimestampFormat = $target.GetTimestampFormat()
+    }
+}
+
+function Set-LoggerMessageFormat
+{
+    <#
+    .SYNOPSIS
+    Sets a logger's text message template and/or timestamp format.
+
+    .DESCRIPTION
+    Only applies to 'Text' output (see Set-LoggerOutputFormat) and is ignored by -Bare writes.
+    Any parameter you omit keeps its current value.
+
+    .PARAMETER Format
+    Template supporting {Timestamp}, {Level}, {Message} tokens.
+
+    .PARAMETER TimestampFormat
+    .NET date format string used for the {Timestamp} token.
+
+    .PARAMETER Logger
+    The Logger instance to update. Defaults to the active logger.
+
+    .EXAMPLE
+    Set-LoggerMessageFormat -Format '[{Timestamp}][{Level}] {Message}' -TimestampFormat 'o'
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter()]
+        [string]$Format,
+
+        [Parameter()]
+        [string]$TimestampFormat,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), 'Set message format'))
+    {
+        if ($PSBoundParameters.ContainsKey('Format'))
+        {
+            $target.SetMessageFormat($Format)
+        }
+        if ($PSBoundParameters.ContainsKey('TimestampFormat'))
+        {
+            $target.SetTimestampFormat($TimestampFormat)
+        }
+    }
+}
+
+function Get-LoggerNativeStreamMode
+{
+    <#
+    .SYNOPSIS
+    Gets whether a logger routes console output through native PowerShell streams.
+
+    .PARAMETER Logger
+    The Logger instance to query. Defaults to the active logger.
+
+    .OUTPUTS
+    System.Boolean
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Position = 0)]
+        [Logger]$Logger
+    )
+
+    (Resolve-TargetLogger -Logger $Logger).GetUseNativeStreams()
+}
+
+function Set-LoggerNativeStreamMode
+{
+    <#
+    .SYNOPSIS
+    Enables or disables native-PowerShell-stream console output for a logger.
+
+    .DESCRIPTION
+    When enabled, console messages are routed through Write-Verbose/-Debug/-Warning/-Error/
+    -Information (chosen by level) instead of colored Write-Host, so -WarningAction/
+    -ErrorAction/$WarningPreference/transcripts see them. Write-Information is silent by
+    default unless $InformationPreference/-InformationAction says otherwise - that's native
+    behavior, not a bug.
+
+    .PARAMETER Enabled
+    $true to use native streams, $false to use colored Write-Host (the default).
+
+    .PARAMETER Logger
+    The Logger instance to update. Defaults to the active logger.
+
+    .EXAMPLE
+    Set-LoggerNativeStreamMode -Enabled $true
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [bool]$Enabled,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Set native streams to $Enabled"))
+    {
+        $target.SetUseNativeStreams($Enabled)
+    }
+}
+
+function Remove-Logger
+{
+    <#
+    .SYNOPSIS
+    Disposes a logger's file mutex handle.
+
+    .DESCRIPTION
+    Each Logger opens a named Mutex that is never otherwise released for the life of the
+    process. Call this when you're done with a logger in a long-running session (e.g. a
+    service that creates many short-lived loggers) to avoid accumulating open handles. If the
+    logger being removed is the active logger, the active logger is cleared.
+
+    .PARAMETER Logger
+    The Logger instance to dispose. Defaults to the active logger.
+
+    .EXAMPLE
+    Remove-Logger -Logger $logger
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Position = 0)]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), 'Dispose logger mutex handle'))
+    {
+        $target.Close()
+        if ($script:ActiveLogger -eq $target)
+        {
+            $script:ActiveLogger = $null
+        }
+    }
+}
+
 function Write-Log
 {
     <#
@@ -1010,6 +1749,21 @@ function Write-Log
     .PARAMETER Bare
     Write the message with no timestamp/level prefix.
 
+    .PARAMETER ErrorRecord
+    An $ErrorRecord (e.g. $_ in a catch block) whose exception type, message, category, and
+    script stack trace are appended to the message. If -Level isn't explicitly specified, it
+    defaults to 'Error' instead of 'Information' when this is used.
+
+    .PARAMETER Exception
+    An exception whose type, message, and .NET stack trace are appended to the message. If
+    -Level isn't explicitly specified, it defaults to 'Error' instead of 'Information' when
+    this is used.
+
+    .PARAMETER Fields
+    Extra structured data for this message. In 'Json' output mode (see Set-LoggerOutputFormat)
+    these become additional JSON properties; in 'Text' mode they're appended as 'key=value'
+    pairs.
+
     .PARAMETER Logger
     The Logger instance to write through. Defaults to the active logger.
 
@@ -1018,11 +1772,18 @@ function Write-Log
 
     .EXAMPLE
     'line one', 'line two' | Write-Log -Level Debug
+
+    .EXAMPLE
+    try { ... } catch { Write-Log 'Import failed' -ErrorRecord $_ }
+
+    .EXAMPLE
+    Write-Log 'User logged in' -Fields @{ UserId = 42; Source = 'CLI' }
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory, Position = 0, ValueFromPipeline)]
-        [string]$Message,
+        [Parameter(Position = 0, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string]$Message = '',
 
         [Parameter()]
         [ValidateSet('None', 'Critical', 'Error', 'Warning', 'Information', 'Debug', 'Verbose', 'Trace')]
@@ -1036,11 +1797,42 @@ function Write-Log
         [switch]$Bare,
 
         [Parameter()]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+
+        [Parameter()]
+        [System.Exception]$Exception,
+
+        [Parameter()]
+        [hashtable]$Fields,
+
+        [Parameter()]
         [Logger]$Logger
     )
 
     process
     {
+        $effectiveMessage = $Message
+
+        if ($PSBoundParameters.ContainsKey('ErrorRecord'))
+        {
+            $detail = "{0}: {1}`nCategory: {2}`nScriptStackTrace:`n{3}" -f `
+                $ErrorRecord.Exception.GetType().FullName, $ErrorRecord.Exception.Message, `
+                $ErrorRecord.CategoryInfo.ToString(), $ErrorRecord.ScriptStackTrace
+            $effectiveMessage = if ($Message) { "$Message`n$detail" } else { $detail }
+            if (-not $PSBoundParameters.ContainsKey('Level')) { $Level = 'Error' }
+        }
+        elseif ($PSBoundParameters.ContainsKey('Exception'))
+        {
+            $detail = "{0}: {1}`nStackTrace:`n{2}" -f `
+                $Exception.GetType().FullName, $Exception.Message, $Exception.StackTrace
+            $effectiveMessage = if ($Message) { "$Message`n$detail" } else { $detail }
+            if (-not $PSBoundParameters.ContainsKey('Level')) { $Level = 'Error' }
+        }
+        elseif (-not $Message)
+        {
+            throw 'Write-Log requires -Message, -ErrorRecord, or -Exception.'
+        }
+
         $target = Resolve-TargetLogger -Logger $Logger
 
         $levelObj = [LoggingLevel]::new($Level)
@@ -1053,7 +1845,7 @@ function Write-Log
             $target.LogDestination
         }
 
-        $target.Write($Message, $levelObj, $destinationObj, $Bare.IsPresent)
+        $target.Write($effectiveMessage, $levelObj, $destinationObj, $Bare.IsPresent, $Fields)
     }
 }
 
@@ -1061,6 +1853,7 @@ function Write-Log
 
 Export-ModuleMember -Function @(
     'New-Logger'
+    'Remove-Logger'
     'Write-Log'
     'Get-ActiveLogger'
     'Set-ActiveLogger'
@@ -1075,4 +1868,12 @@ Export-ModuleMember -Function @(
     'Get-LoggerFullPath'
     'Get-LoggerTimeout'
     'Set-LoggerTimeout'
+    'Get-LoggerRotation'
+    'Set-LoggerRotation'
+    'Get-LoggerOutputFormat'
+    'Set-LoggerOutputFormat'
+    'Get-LoggerMessageFormat'
+    'Set-LoggerMessageFormat'
+    'Get-LoggerNativeStreamMode'
+    'Set-LoggerNativeStreamMode'
 )

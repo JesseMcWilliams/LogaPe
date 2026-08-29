@@ -73,6 +73,116 @@ Describe 'LogaPe' {
         }
     }
 
+    Context 'Per-destination levels' {
+        It 'a message below the console level but at/above the file level still reaches the file' {
+            $logger = New-Logger -Level Verbose -Folder $script:LogFolder -FileName 'per-dest.log' -UseFileNameAsIs -Destination Both
+            Set-LoggerLevel -Level Warning -Destination Console -Logger $logger
+            Set-LoggerLevel -Level Verbose -Destination File -Logger $logger
+
+            Write-Log 'debug detail' -Logger $logger -Level Debug *> $null
+
+            Get-Content (Get-LoggerFullPath -Logger $logger) -Raw | Should -Match 'debug detail'
+        }
+
+        It 'Get-LoggerLevel returns a single value when both destinations match' {
+            $logger = New-Logger -Level Information -Folder $script:LogFolder -FileName 'same-level.log' -UseFileNameAsIs
+            Get-LoggerLevel -Logger $logger | Should -Be 'Information'
+        }
+
+        It 'Get-LoggerLevel returns an object with Console/File properties when they differ' {
+            $logger = New-Logger -Level Information -Folder $script:LogFolder -FileName 'diff-level.log' -UseFileNameAsIs
+            Set-LoggerLevel -Level Error -Destination Console -Logger $logger
+
+            $result = Get-LoggerLevel -Logger $logger
+            $result.Console | Should -Be 'Error'
+            $result.File | Should -Be 'Information'
+        }
+    }
+
+    Context 'JSON output format' {
+        It 'writes a parseable JSON line with the message and custom fields' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'json.log' -UseFileNameAsIs -Destination File -OutputFormat Json
+            Write-Log 'structured message' -Logger $logger -Level Warning -Fields @{ UserId = 42 }
+
+            $line = Get-Content (Get-LoggerFullPath -Logger $logger) -Raw
+            $parsed = $line | ConvertFrom-Json
+            $parsed.Message | Should -Be 'structured message'
+            $parsed.Level | Should -Be 'Warning'
+            $parsed.UserId | Should -Be 42
+        }
+    }
+
+    Context 'Rotation and retention' {
+        It 'rolls the file over once it exceeds -MaxSizeMB and prunes to -MaxArchivedFiles' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'rotate.log' -UseFileNameAsIs -Destination File -MaxSizeMB 0.0001 -MaxArchivedFiles 2
+            1..5 | ForEach-Object { Write-Log ('x' * 200) -Logger $logger -Bare }
+
+            $archived = Get-ChildItem $script:LogFolder -Filter 'rotate.*.log'
+            $archived.Count | Should -Be 2
+            (Get-LoggerFullPath -Logger $logger) | Should -Exist
+        }
+
+        It 'Set-LoggerRotation updates settings incrementally, leaving unspecified ones alone' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'rotation-settings.log' -UseFileNameAsIs -MaxSizeMB 5 -RetentionDays 10
+
+            Set-LoggerRotation -MaxArchivedFiles 3 -Logger $logger
+
+            $settings = Get-LoggerRotation -Logger $logger
+            $settings.MaxSizeMB | Should -Be 5
+            $settings.RetentionDays | Should -Be 10
+            $settings.MaxArchivedFiles | Should -Be 3
+        }
+    }
+
+    Context 'Exception-aware logging' {
+        It 'appends ErrorRecord details and defaults the level to Error' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'exception.log' -UseFileNameAsIs -Destination File -Level Verbose
+
+            try { throw 'boom' } catch { Write-Log 'operation failed' -Logger $logger -ErrorRecord $_ }
+
+            $content = Get-Content (Get-LoggerFullPath -Logger $logger) -Raw
+            $content | Should -Match 'operation failed'
+            $content | Should -Match 'boom'
+            $content | Should -Match '\|\s+Error\s+\|'
+        }
+
+        It 'requires -Message, -ErrorRecord, or -Exception' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'exception-required.log' -UseFileNameAsIs
+            { Write-Log -Logger $logger } | Should -Throw '*Message*'
+        }
+    }
+
+    Context 'Native stream output' {
+        It 'routes Warning-level messages through Write-Warning instead of Write-Host' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'native.log' -UseFileNameAsIs -Destination Console
+            Set-LoggerNativeStreamMode -Enabled $true -Logger $logger
+
+            $captured = Write-Log 'native warning' -Logger $logger -Level Warning -WarningAction Continue 3>&1
+
+            [string]$captured | Should -Match 'native warning'
+        }
+    }
+
+    Context 'Remove-Logger' {
+        It 'disposes the mutex handle' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'dispose.log' -UseFileNameAsIs -Destination File
+            $mutex = $logger.GetLoggingMutex()
+
+            Remove-Logger -Logger $logger -Confirm:$false
+
+            $disposed = $false
+            try { $mutex.WaitOne(100) | Out-Null } catch [System.ObjectDisposedException] { $disposed = $true }
+            $disposed | Should -BeTrue
+        }
+
+        It 'clears the active logger if the removed logger was active' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'dispose-active.log' -UseFileNameAsIs -Destination File -SetActive
+            Remove-Logger -Logger $logger -Confirm:$false
+
+            Get-ActiveLogger | Should -BeNullOrEmpty
+        }
+    }
+
     Context 'Concurrent writes' {
         It 'serializes writes from multiple runspaces without losing or interleaving lines' {
             $logger = New-Logger -Folder $script:LogFolder -FileName 'concurrent.log' -UseFileNameAsIs -Destination File -TimeoutSeconds 10

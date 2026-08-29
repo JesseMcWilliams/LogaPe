@@ -3,6 +3,52 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioning follows [SemVer](https://semver.org/).
 
+## [0.2.0] - 2026-08-28
+
+### Added
+- Log rotation and retention: `-MaxSizeMB` and/or `-RotateDaily` on `New-Logger` roll the log
+  file over (checked under the file mutex, so concurrent writers never race to rotate the same
+  file); `-RetentionDays`/`-MaxArchivedFiles` prune old rolled-over files. Read/write later with
+  `Get-LoggerRotation`/`Set-LoggerRotation` (the setter updates incrementally - parameters you
+  omit keep their current value).
+- Independent console/file logging levels: `Set-LoggerLevel` gained a `-Destination`
+  parameter (`Console`, `File`, or `Both`, default); `Get-LoggerLevel` returns a single value
+  when both match or a `[pscustomobject]` with `Console`/`File` properties when they differ.
+- Structured JSON output: `New-Logger -OutputFormat Json` writes one JSON object per line
+  (`Timestamp`, `Level`, `Message`, plus any `-Fields` hashtable passed to `Write-Log`) to
+  every active destination, console included. `Get-/Set-LoggerOutputFormat` toggle it later.
+- Customizable text formatting: `Get-/Set-LoggerMessageFormat` control the `Text`-mode message
+  template (`{Timestamp}`/`{Level}`/`{Message}` tokens) and the timestamp's .NET format string,
+  replacing the previously hardcoded layout.
+- Exception-aware `Write-Log`: new `-ErrorRecord`/`-Exception` parameters append the
+  exception's type, message, category (for `-ErrorRecord`), and stack trace to the message,
+  and default `-Level` to `Error` instead of `Information` when used.
+- `-Fields <hashtable>` on `Write-Log` for structured extra data - merged into the JSON object
+  in `Json` mode, appended as `key=value` pairs in `Text` mode.
+- Opt-in native PowerShell stream output: `New-Logger -UseNativeStreams` (or
+  `Set-LoggerNativeStreamMode` later) routes console output through
+  `Write-Verbose`/`-Debug`/`-Warning`/`-Error`/`-Information` (chosen by level) instead of
+  colored `Write-Host`, so `-WarningAction`/`-ErrorAction`/`$WarningPreference`/transcripts see
+  it. Verified empirically that `-WarningAction`/`-ErrorAction` passed to `Write-Log` does
+  propagate into the underlying native-stream call made inside the `Logger` class method.
+  `Write-Information` stays silent by default unless `$InformationPreference`/
+  `-InformationAction` says otherwise - native `Write-Information` behavior, not a bug.
+- `Remove-Logger` disposes a logger's named-mutex handle (never otherwise released for the
+  process's lifetime) and clears the active logger if it was the one removed - for long-running
+  sessions that create many short-lived loggers.
+
+### Changed
+- `Logger`'s internal single `TargetLogLevel` field became separate `ConsoleLevel`/`FileLevel`
+  fields; the `Write()` method overloads now filter and route each destination independently
+  rather than gating both together, and gained a 5th overload accepting a `-Fields` hashtable.
+
+### Fixed
+- Fixed an archive-filename collision in log rotation: rotating faster than once per second
+  (e.g. a very small `-MaxSizeMB` under sustained writes) produced the same
+  `<name>.<yyyyMMdd-HHmmss>.<extension>` name twice, causing `Rename-Item` to fail with
+  "Cannot create a file when that file already exists." Archive names now include milliseconds
+  and fall back to a numeric suffix on any remaining collision.
+
 ## [0.1.0] - 2026-08-28
 
 ### Changed

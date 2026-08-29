@@ -56,19 +56,96 @@ From lowest to highest severity: `Verbose`/`Trace` (same rank), `Debug`, `Inform
 `Warning`, `Error`, `Critical`, `None` (matches nothing — effectively disables logging).
 A logger only writes messages at or above its configured level.
 
+Console and file can be filtered independently:
+
+```powershell
+$logger = New-Logger -Destination Both -SetActive
+Set-LoggerLevel -Level Warning -Destination Console   # quiet terminal
+Set-LoggerLevel -Level Verbose -Destination File       # detailed file
+```
+
+## Log rotation and retention
+
+```powershell
+New-Logger -Destination File -MaxSizeMB 10 -RotateDaily -RetentionDays 30 -MaxArchivedFiles 20 -SetActive
+```
+
+The file rolls over once it exceeds `-MaxSizeMB` and/or on the first write of a new calendar
+day (`-RotateDaily`), whichever comes first. Rolled-over files are named
+`<name>.<yyyyMMdd-HHmmss>.<extension>` next to the active log; `-RetentionDays` and/or
+`-MaxArchivedFiles` prune them (never the active file). Adjust settings later with
+`Set-LoggerRotation` (any parameter you omit keeps its current value) or read them back with
+`Get-LoggerRotation`.
+
+## Structured (JSON) output
+
+```powershell
+New-Logger -Destination File -OutputFormat Json -SetActive
+Write-Log 'user logged in' -Fields @{ UserId = 42; Source = 'CLI' }
+# {"Timestamp":"2026-08-28 19:00:00","Level":"Information","Message":"user logged in","UserId":42,"Source":"CLI"}
+```
+
+`-Fields` works in `Text` mode too, appended as `key=value` pairs. Switch formats later with
+`Set-LoggerOutputFormat`; customize the `Text` template and timestamp format with
+`Set-LoggerMessageFormat` (tokens: `{Timestamp}`, `{Level}`, `{Message}`).
+
+## Exception-aware logging
+
+```powershell
+try
+{
+    Import-CsvData $path
+}
+catch
+{
+    Write-Log 'Import failed' -ErrorRecord $_   # appends exception type, message, and stack trace; defaults -Level to Error
+}
+```
+
+`-Exception` works the same way for a bare `[System.Exception]`. If `-Level` isn't specified
+explicitly, both default it to `Error` rather than `Information`.
+
+## Native PowerShell streams
+
+By default, console output is colored `Write-Host` text. Opt into routing it through
+`Write-Verbose`/`-Debug`/`-Warning`/`-Error`/`-Information` instead (chosen by message level),
+so `-WarningAction`/`-ErrorAction`/`$WarningPreference`/transcripts see it:
+
+```powershell
+New-Logger -Destination Console -UseNativeStreams -SetActive
+```
+
+`Write-Information` is silent by default unless `$InformationPreference`/`-InformationAction`
+says otherwise — that's native PowerShell behavior for `Information`-level messages, not a
+LogaPe quirk. Toggle this later with `Set-LoggerNativeStreamMode`.
+
+## Cleaning up
+
+Each logger opens a named mutex that otherwise lives for the process's lifetime. If you create
+many short-lived loggers in a long-running session, dispose them when done:
+
+```powershell
+Remove-Logger -Logger $logger
+```
+
 ## Reference
 
 | Function | Purpose |
 |---|---|
 | `New-Logger` | Create a logger |
+| `Remove-Logger` | Dispose a logger's mutex handle |
 | `Write-Log` | Write a message |
 | `Get-ActiveLogger` / `Set-ActiveLogger` | Read/set the module's active logger |
-| `Get-LoggerLevel` / `Set-LoggerLevel` | Read/set the minimum level |
+| `Get-LoggerLevel` / `Set-LoggerLevel` | Read/set the minimum level (optionally per-destination) |
 | `Get-LoggerDestination` / `Set-LoggerDestination` | Read/set Console/File/Both |
 | `Get-LoggerPath` / `Set-LoggerPath` | Read/set the log folder |
 | `Get-LoggerFile` / `Set-LoggerFile` | Read/set the log file name |
 | `Get-LoggerFullPath` | Read the full log file path |
 | `Get-LoggerTimeout` / `Set-LoggerTimeout` | Read/set the write-retry timeout (seconds) |
+| `Get-LoggerRotation` / `Set-LoggerRotation` | Read/set size/date rotation and retention |
+| `Get-LoggerOutputFormat` / `Set-LoggerOutputFormat` | Read/set Text/Json |
+| `Get-LoggerMessageFormat` / `Set-LoggerMessageFormat` | Read/set the Text template and timestamp format |
+| `Get-LoggerNativeStreamMode` / `Set-LoggerNativeStreamMode` | Read/set native-stream console output |
 
 Run `Get-Help <function> -Full` for parameters and examples.
 
