@@ -71,6 +71,24 @@ class LoggingDestination
     }
 }
 
+# An independent output beyond Console/File (e.g. Event Log), each with its own minimum level
+# so a logger can, say, send only Critical/Error to a sink while File still captures Verbose.
+class LoggingSink
+{
+    [string] $Id
+    [string] $Type
+    [LoggingLevel] $Level
+    [hashtable] $Config
+
+    LoggingSink([string]$Type, [LoggingLevel]$Level, [hashtable]$Config)
+    {
+        $this.Id = [guid]::NewGuid().ToString()
+        $this.Type = $Type
+        $this.Level = $Level
+        $this.Config = $Config
+    }
+}
+
 class LoggingObject
 {
     hidden [string] $LoggingFile
@@ -360,6 +378,7 @@ class Logger
     hidden [string] $MessageFormat = '{Timestamp} | {Level} | {Message}'
     hidden [string] $TimestampFormat = 'yyyy-MM-dd HH:mm:ss'
     hidden [bool] $UseNativeStreams = $false
+    hidden [System.Collections.Generic.List[LoggingSink]] $Sinks = [System.Collections.Generic.List[LoggingSink]]::new()
 
     [LoggingDestination] $LogDestination
 
@@ -460,6 +479,27 @@ class Logger
         $this.LogFileObj.Dispose()
     }
 
+    [string]AddSink([string]$Type, [LoggingLevel]$Level, [hashtable]$Config)
+    {
+        $sink = [LoggingSink]::new($Type, $Level, $Config)
+        $this.Sinks.Add($sink)
+        return $sink.Id
+    }
+
+    [void]RemoveSink([string]$Id)
+    {
+        $match = $this.Sinks | Where-Object { $_.Id -eq $Id }
+        if ($match)
+        {
+            [void]$this.Sinks.Remove($match)
+        }
+    }
+
+    [System.Collections.Generic.List[LoggingSink]]GetSinks()
+    {
+        return $this.Sinks
+    }
+
     [void]SetLoggingPath([string]$FolderPath)
     {
         if ([System.IO.Path]::IsPathRooted($FolderPath))
@@ -529,6 +569,7 @@ class Logger
                "`r`n`tPath         | $($this.LogFilePath)" +
                "`r`n`tDestination  | $($this.LogDestination.LogDestination)" +
                "`r`n`tOutputFormat | $($this.OutputFormat)" +
+               "`r`n`tSinks        | $($this.Sinks.Count)" +
                "`r`n`tMutexName    | $($this.LogFileObj.GetLoggingMutexName())"
     }
 
@@ -558,16 +599,17 @@ class Logger
     {
         $writeConsole = $Destination.Console() -and ($this.ConsoleLevel.Level() -le $Level.Level())
         $writeFile = $Destination.File() -and ($this.FileLevel.Level() -le $Level.Level())
+        $activeSinks = @($this.Sinks | Where-Object { $_.Level.Level() -le $Level.Level() })
 
-        if (-not $writeConsole -and -not $writeFile)
+        if (-not $writeConsole -and -not $writeFile -and $activeSinks.Count -eq 0)
         {
             return
         }
 
-        $this._WriteOutput($Message, $Level, $writeConsole, $writeFile, $Bare, $Fields)
+        $this._WriteOutput($Message, $Level, $writeConsole, $writeFile, $Bare, $Fields, $activeSinks)
     }
 
-    hidden [void]_WriteOutput([string]$Message, [LoggingLevel]$Level, [bool]$WriteConsole, [bool]$WriteFile, [bool]$Bare, [hashtable]$Fields)
+    hidden [void]_WriteOutput([string]$Message, [LoggingLevel]$Level, [bool]$WriteConsole, [bool]$WriteFile, [bool]$Bare, [hashtable]$Fields, [array]$ActiveSinks)
     {
         $formatted = $this.FormatMessage($Message, $Level, $Bare, $Fields)
 
@@ -586,6 +628,11 @@ class Logger
         if ($WriteFile)
         {
             $this.LogFileObj.WriteFile($formatted)
+        }
+
+        foreach ($sink in $ActiveSinks)
+        {
+            $this.WriteToSink($sink, $formatted, $Level)
         }
     }
 
@@ -662,6 +709,39 @@ class Logger
         else
         {
             Write-Information $FormattedMessage
+        }
+    }
+
+    # A write failure here (e.g. the Event Log source was never successfully registered)
+    # shouldn't take down the caller's script - warn and move on, same as WriteFile's own
+    # failure handling philosophy.
+    hidden [void]WriteToSink([LoggingSink]$Sink, [string]$FormattedMessage, [LoggingLevel]$Level)
+    {
+        if ($Sink.Type -eq 'EventLog')
+        {
+            $levelName = $Level.Name()
+            $entryType = if ($levelName -eq 'Critical' -or $levelName -eq 'Error')
+            {
+                'Error'
+            }
+            elseif ($levelName -eq 'Warning')
+            {
+                'Warning'
+            }
+            else
+            {
+                'Information'
+            }
+
+            try
+            {
+                Write-EventLog -LogName $Sink.Config.LogName -Source $Sink.Config.Source `
+                    -EventId $Sink.Config.EventId -EntryType $entryType -Message $FormattedMessage -ErrorAction Stop
+            }
+            catch
+            {
+                Write-Warning "Failed to write to Event Log sink '$($Sink.Config.Source)': $($_.Exception.Message)"
+            }
         }
     }
 }
@@ -883,6 +963,92 @@ function Get-LoggerFullPath
     )
 
     (Resolve-TargetLogger -Logger $Logger).GetLoggingFullPath()
+}
+
+function Get-LoggerContent
+{
+    <#
+    .SYNOPSIS
+    Reads, or follows, a logger's log file.
+
+    .DESCRIPTION
+    A thin wrapper over Get-Content pointed at the logger's file, so you don't have to look up
+    the path yourself. Supports the same -Tail/-Wait semantics as Get-Content.
+
+    .PARAMETER Tail
+    Only return the last N lines. Omit to return the whole file.
+
+    .PARAMETER Wait
+    Keep the file open and emit new lines as they're written (like `tail -f`), blocking until
+    interrupted (e.g. Ctrl+C) or the pipeline is stopped.
+
+    .PARAMETER AsObject
+    Parse each line as JSON and emit the resulting object instead of the raw string. Intended
+    for loggers using -OutputFormat Json (see Set-LoggerOutputFormat). A line that isn't valid
+    JSON is returned as its raw string, with a warning, rather than aborting the read.
+
+    .PARAMETER Logger
+    The Logger instance to read. Defaults to the active logger.
+
+    .EXAMPLE
+    Get-LoggerContent -Tail 20
+
+    .EXAMPLE
+    Get-LoggerContent -Wait
+
+    .EXAMPLE
+    Get-LoggerContent -AsObject | Where-Object Level -eq 'Error'
+
+    .OUTPUTS
+    System.String, or a parsed object per line when -AsObject is used.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter()]
+        [int]$Tail,
+
+        [Parameter()]
+        [Alias('Follow')]
+        [switch]$Wait,
+
+        [Parameter()]
+        [switch]$AsObject,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $path = (Resolve-TargetLogger -Logger $Logger).GetLoggingFullPath()
+
+    $getContentParams = @{
+        LiteralPath = $path
+        Wait        = $Wait.IsPresent
+    }
+    if ($PSBoundParameters.ContainsKey('Tail'))
+    {
+        $getContentParams['Tail'] = $Tail
+    }
+
+    Get-Content @getContentParams | ForEach-Object {
+        $line = $_
+        if (-not $AsObject)
+        {
+            return $line
+        }
+
+        try
+        {
+            $line | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch
+        {
+            # $_ here is the caught error, not the pipeline item - use $line instead.
+            Write-Warning "Line is not valid JSON, returning raw text: $line"
+            $line
+        }
+    }
 }
 
 function Get-LoggerLevel
@@ -1724,6 +1890,160 @@ function Remove-Logger
     }
 }
 
+function Add-LoggerEventLogSink
+{
+    <#
+    .SYNOPSIS
+    Sends a logger's messages to the Windows Event Log as well.
+
+    .DESCRIPTION
+    Registers an independent sink with its own minimum level, separate from the logger's
+    Console/File levels - e.g. only send Critical/Error to the Event Log while File keeps
+    capturing everything at Verbose. A logger can have any number of sinks.
+
+    If -Source isn't already a registered event source, this attempts to register it via
+    New-EventLog, which requires local administrator rights. On failure, it emits a warning
+    explaining how to pre-register the source manually and still adds the sink - later writes
+    will retry and fail individually (with their own warning) rather than the registration
+    failure blocking your script.
+
+    .PARAMETER Source
+    The event source name to write under.
+
+    .PARAMETER LogName
+    The Windows Event Log to write to. Defaults to 'Application'.
+
+    .PARAMETER Level
+    Minimum level that reaches this sink. Defaults to 'Warning' - Event Logs are usually for
+    things worth someone's attention, not routine Verbose/Debug/Information noise.
+
+    .PARAMETER EventId
+    Numeric event ID recorded with each entry. Defaults to 1.
+
+    .PARAMETER Logger
+    The Logger instance to add this sink to. Defaults to the active logger.
+
+    .EXAMPLE
+    Add-LoggerEventLogSink -Source 'MyApp' -Level Error
+
+    .OUTPUTS
+    System.String - the new sink's Id, for use with Remove-LoggerSink.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [string]$Source,
+
+        [Parameter()]
+        [string]$LogName = 'Application',
+
+        [Parameter()]
+        [ValidateSet('None', 'Critical', 'Error', 'Warning', 'Information', 'Debug', 'Verbose', 'Trace')]
+        [string]$Level = 'Warning',
+
+        [Parameter()]
+        [int]$EventId = 1,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+
+    if (-not $PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Add Event Log sink (Source '$Source')"))
+    {
+        return $null
+    }
+
+    try
+    {
+        if (-not [System.Diagnostics.EventLog]::SourceExists($Source))
+        {
+            New-EventLog -LogName $LogName -Source $Source -ErrorAction Stop
+        }
+    }
+    catch
+    {
+        # The -f operator binds tighter than +, so the format string must be fully parenthesized
+        # before formatting - otherwise it silently only formats the last concatenated fragment.
+        $template = "Could not register event source '{0}' automatically (requires local " +
+            "administrator rights): {1}. Pre-register it manually as Administrator: " +
+            "New-EventLog -LogName '{2}' -Source '{0}'. The sink is still added; writes will " +
+            'fail individually (with their own warning) until the source exists.'
+        Write-Warning ($template -f $Source, $_.Exception.Message, $LogName)
+    }
+
+    $config = @{ Source = $Source; LogName = $LogName; EventId = $EventId }
+    $target.AddSink('EventLog', [LoggingLevel]::new($Level), $config)
+}
+
+function Get-LoggerSink
+{
+    <#
+    .SYNOPSIS
+    Lists the sinks registered on a logger.
+
+    .PARAMETER Logger
+    The Logger instance to query. Defaults to the active logger.
+
+    .EXAMPLE
+    Get-LoggerSink
+
+    .OUTPUTS
+    A [pscustomobject] per sink, with Id, Type, Level, and Config.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    foreach ($sink in $target.GetSinks())
+    {
+        [pscustomobject]@{
+            Id     = $sink.Id
+            Type   = $sink.Type
+            Level  = $sink.Level.Name()
+            Config = $sink.Config
+        }
+    }
+}
+
+function Remove-LoggerSink
+{
+    <#
+    .SYNOPSIS
+    Removes a sink previously added with an Add-Logger*Sink function (e.g.
+    Add-LoggerEventLogSink).
+
+    .PARAMETER Id
+    The sink's Id, as returned by the function that added it, or from Get-LoggerSink.
+
+    .PARAMETER Logger
+    The Logger instance to remove it from. Defaults to the active logger.
+
+    .EXAMPLE
+    $sinkId = Add-LoggerEventLogSink -Source 'MyApp'
+    Remove-LoggerSink -Id $sinkId
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [string]$Id,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Remove sink '$Id'"))
+    {
+        $target.RemoveSink($Id)
+    }
+}
+
 function Write-Log
 {
     <#
@@ -1854,6 +2174,9 @@ function Write-Log
 Export-ModuleMember -Function @(
     'New-Logger'
     'Remove-Logger'
+    'Add-LoggerEventLogSink'
+    'Get-LoggerSink'
+    'Remove-LoggerSink'
     'Write-Log'
     'Get-ActiveLogger'
     'Set-ActiveLogger'
@@ -1866,6 +2189,7 @@ Export-ModuleMember -Function @(
     'Get-LoggerFile'
     'Set-LoggerFile'
     'Get-LoggerFullPath'
+    'Get-LoggerContent'
     'Get-LoggerTimeout'
     'Set-LoggerTimeout'
     'Get-LoggerRotation'

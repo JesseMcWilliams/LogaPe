@@ -183,6 +183,131 @@ Describe 'LogaPe' {
         }
     }
 
+    Context 'Event Log sink' {
+        # Registering a real event source needs local admin rights, which the test runner may
+        # or may not have - so these tests avoid asserting on whether Write-EventLog itself
+        # succeeds or fails, and instead verify the parts that are deterministic regardless of
+        # elevation: registration/listing/removal of the sink, that level filtering means the
+        # sink is never invoked at all below its threshold, and that a write attempt (success
+        # or the caught-and-warned failure path) never throws back to the caller.
+        It 'adds a sink and lists it via Get-LoggerSink' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'eventlog.log' -UseFileNameAsIs -Destination File
+            $sinkId = Add-LoggerEventLogSink -Source 'LogaPeTestSource' -Level Error -Logger $logger -WarningAction SilentlyContinue
+
+            $sink = Get-LoggerSink -Logger $logger
+            $sink.Id | Should -Be $sinkId
+            $sink.Type | Should -Be 'EventLog'
+            $sink.Level | Should -Be 'Error'
+            $sink.Config.Source | Should -Be 'LogaPeTestSource'
+            $sink.Config.LogName | Should -Be 'Application'
+        }
+
+        It 'never dispatches to the sink for messages below its level' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'eventlog-filter.log' -UseFileNameAsIs -Destination File
+            Add-LoggerEventLogSink -Source 'LogaPeTestSourceFilter' -Level Error -Logger $logger -WarningAction SilentlyContinue | Out-Null
+
+            Write-Log 'below sink threshold' -Logger $logger -Level Warning -WarningVariable belowWarnings -WarningAction SilentlyContinue
+
+            ($belowWarnings | Where-Object { $_ -match 'Failed to write to Event Log sink' }) | Should -BeNullOrEmpty
+        }
+
+        It 'does not throw when writing at/above the sink level, whether the write succeeds or fails' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'eventlog-write.log' -UseFileNameAsIs -Destination File
+            Add-LoggerEventLogSink -Source 'LogaPeTestSourceWrite' -Level Error -Logger $logger -WarningAction SilentlyContinue | Out-Null
+
+            { Write-Log 'at sink threshold' -Logger $logger -Level Error -WarningAction SilentlyContinue } | Should -Not -Throw
+        }
+
+        It 'removes a sink so it no longer appears in Get-LoggerSink' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'eventlog-remove.log' -UseFileNameAsIs -Destination File
+            $sinkId = Add-LoggerEventLogSink -Source 'LogaPeTestSourceRemove' -Level Error -Logger $logger -WarningAction SilentlyContinue
+
+            Remove-LoggerSink -Id $sinkId -Logger $logger -Confirm:$false
+
+            Get-LoggerSink -Logger $logger | Should -BeNullOrEmpty
+            { Write-Log 'after removal' -Logger $logger -Level Error -WarningAction SilentlyContinue } | Should -Not -Throw
+        }
+    }
+
+    Context 'Get-LoggerContent' {
+        It 'returns the full file content by default' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'content.log' -UseFileNameAsIs -Destination File
+            Write-Log 'line one' -Logger $logger -Bare
+            Write-Log 'line two' -Logger $logger -Bare
+
+            $lines = Get-LoggerContent -Logger $logger
+            $lines | Should -Be @('line one', 'line two')
+        }
+
+        It 'returns only the last N lines with -Tail' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'content-tail.log' -UseFileNameAsIs -Destination File
+            1..5 | ForEach-Object { Write-Log "line $_" -Logger $logger -Bare }
+
+            Get-LoggerContent -Logger $logger -Tail 2 | Should -Be @('line 4', 'line 5')
+        }
+
+        It 'parses JSON lines into objects with -AsObject' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'content-json.log' -UseFileNameAsIs -Destination File -OutputFormat Json
+            Write-Log 'structured' -Logger $logger -Level Warning -Fields @{ UserId = 7 }
+
+            $result = Get-LoggerContent -Logger $logger -AsObject
+            $result.Message | Should -Be 'structured'
+            $result.Level | Should -Be 'Warning'
+            $result.UserId | Should -Be 7
+        }
+
+        It 'returns raw text with a warning for a non-JSON line when -AsObject is used' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'content-not-json.log' -UseFileNameAsIs -Destination File
+            Write-Log 'plain text line' -Logger $logger -Bare
+
+            $result = Get-LoggerContent -Logger $logger -AsObject -WarningVariable warnings -WarningAction SilentlyContinue
+            $result | Should -Be 'plain text line'
+            $warnings | Should -Match 'not valid JSON'
+        }
+
+        It 'emits new lines as they are written with -Wait' {
+            $fileName = 'content-tail-wait.log'
+            $writerLogger = New-Logger -Folder $script:LogFolder -FileName $fileName -UseFileNameAsIs -Destination File
+            Write-Log 'existing line' -Logger $writerLogger -Bare
+
+            $ps = [powershell]::Create()
+            [void]$ps.AddScript({
+                    param($ModulePath, $Folder, $FileName)
+                    Import-Module $ModulePath -Force
+                    $logger = New-Logger -Folder $Folder -FileName $FileName -UseFileNameAsIs -Destination File
+                    Get-LoggerContent -Logger $logger -Wait
+                }).AddArgument($script:ModuleManifest).AddArgument($script:LogFolder).AddArgument($fileName)
+
+            # BeginInvoke's generic overloads need both arguments strongly typed to resolve -
+            # passing $null for "no input" fails overload resolution.
+            $inputCollection = [System.Management.Automation.PSDataCollection[psobject]]::new()
+            $inputCollection.Complete()
+            $outputCollection = [System.Management.Automation.PSDataCollection[psobject]]::new()
+            $asyncResult = $ps.BeginInvoke($inputCollection, $outputCollection)
+
+            try
+            {
+                # Give the background tail time to reach Get-Content -Wait before writing.
+                Start-Sleep -Milliseconds 500
+                Write-Log 'tailed line' -Logger $writerLogger -Bare
+
+                $deadline = (Get-Date).AddSeconds(5)
+                while ((Get-Date) -lt $deadline -and -not ($outputCollection -contains 'tailed line'))
+                {
+                    Start-Sleep -Milliseconds 100
+                }
+            }
+            finally
+            {
+                $ps.Stop() | Out-Null
+                try { $ps.EndInvoke($asyncResult) } catch { }
+                $ps.Dispose()
+            }
+
+            $outputCollection | Should -Contain 'tailed line'
+        }
+    }
+
     Context 'Concurrent writes' {
         It 'serializes writes from multiple runspaces without losing or interleaving lines' {
             $logger = New-Logger -Folder $script:LogFolder -FileName 'concurrent.log' -UseFileNameAsIs -Destination File -TimeoutSeconds 10

@@ -3,6 +3,32 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioning follows [SemVer](https://semver.org/).
 
+## [0.3.0] - 2026-08-28
+
+### Added
+- `Get-LoggerContent` reads a logger's log file, wrapping `Get-Content`'s own `-Tail`/`-Wait`
+  semantics so tailing a log (`Get-LoggerContent -Wait`, like `tail -f`) doesn't require looking
+  up the file path yourself. `-AsObject` parses each line as JSON for loggers using
+  `-OutputFormat Json`; a line that isn't valid JSON is returned as raw text with a warning
+  instead of aborting the read.
+- Sinks: independent outputs alongside Console/File, each with its own minimum level (e.g.
+  only Critical/Error reaches a sink while File keeps capturing Verbose).
+  `Add-LoggerEventLogSink` adds a Windows Event Log sink, attempting to auto-register the event
+  source via `New-EventLog` (requires local administrator rights; on failure it warns with
+  manual pre-registration steps and still adds the sink - individual writes fail with their own
+  warning, rather than throwing, until the source exists). `Get-LoggerSink` lists a logger's
+  sinks; `Remove-LoggerSink` removes one by Id.
+
+### Fixed
+- Fixed a `$_`-shadowing bug in `Get-LoggerContent -AsObject`'s malformed-JSON fallback: inside
+  a `catch` block, `$_` refers to the caught error, not the original pipeline item, so the
+  fallback was returning the JSON parser's error message instead of the original line.
+- Fixed an operator-precedence bug in `Add-LoggerEventLogSink`'s registration-failure warning:
+  the format operator (`-f`) binds tighter than string concatenation (`+`), so
+  `"a" + "b" -f $x` only formats `"b"`, not the whole concatenated string. The `{0}`/`{1}`/`{2}`
+  placeholders in the earlier fragments were never substituted, showing up literally in the
+  warning text. Fixed by building the full template first, then formatting it as one string.
+
 ## [0.2.0] - 2026-08-28
 
 ### Added

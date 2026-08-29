@@ -119,6 +119,35 @@ New-Logger -Destination Console -UseNativeStreams -SetActive
 says otherwise — that's native PowerShell behavior for `Information`-level messages, not a
 LogaPe quirk. Toggle this later with `Set-LoggerNativeStreamMode`.
 
+## Reading and tailing the log
+
+```powershell
+Get-LoggerContent -Tail 20        # last 20 lines
+Get-LoggerContent -Wait           # follow, like `tail -f` (Ctrl+C to stop)
+Get-LoggerContent -AsObject | Where-Object Level -eq 'Error'   # parse Json-format lines
+```
+
+`-AsObject` parses each line as JSON (for loggers using `-OutputFormat Json`); a line that
+isn't valid JSON comes back as its raw string with a warning instead of aborting the read.
+
+## Additional sinks (Windows Event Log)
+
+A sink is an independent output alongside Console/File, with its own minimum level - e.g. only
+send Critical/Error to the Event Log while the file keeps capturing everything at Verbose:
+
+```powershell
+$sinkId = Add-LoggerEventLogSink -Source 'MyApp' -Level Error
+Write-Log 'disk nearly full' -Level Warning   # console/file only, below the sink's level
+Write-Log 'unrecoverable failure' -Level Error   # console/file, and the Event Log
+Remove-LoggerSink -Id $sinkId
+```
+
+If `-Source` isn't already a registered event source, `Add-LoggerEventLogSink` tries to
+register it via `New-EventLog`, which needs local administrator rights. Without them, it warns
+and explains how to pre-register the source manually — the sink is still added, and later
+writes fail individually (with their own warning) rather than throwing. `Get-LoggerSink` lists
+every sink registered on a logger.
+
 ## Cleaning up
 
 Each logger opens a named mutex that otherwise lives for the process's lifetime. If you create
@@ -141,11 +170,14 @@ Remove-Logger -Logger $logger
 | `Get-LoggerPath` / `Set-LoggerPath` | Read/set the log folder |
 | `Get-LoggerFile` / `Set-LoggerFile` | Read/set the log file name |
 | `Get-LoggerFullPath` | Read the full log file path |
+| `Get-LoggerContent` | Read or tail (`-Wait`) the log file, optionally parsing JSON lines (`-AsObject`) |
 | `Get-LoggerTimeout` / `Set-LoggerTimeout` | Read/set the write-retry timeout (seconds) |
 | `Get-LoggerRotation` / `Set-LoggerRotation` | Read/set size/date rotation and retention |
 | `Get-LoggerOutputFormat` / `Set-LoggerOutputFormat` | Read/set Text/Json |
 | `Get-LoggerMessageFormat` / `Set-LoggerMessageFormat` | Read/set the Text template and timestamp format |
 | `Get-LoggerNativeStreamMode` / `Set-LoggerNativeStreamMode` | Read/set native-stream console output |
+| `Add-LoggerEventLogSink` | Add a Windows Event Log sink with its own minimum level |
+| `Get-LoggerSink` / `Remove-LoggerSink` | List / remove a logger's sinks |
 
 Run `Get-Help <function> -Full` for parameters and examples.
 
