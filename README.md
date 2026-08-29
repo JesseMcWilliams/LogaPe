@@ -184,7 +184,9 @@ Run `Get-Help <function> -Full` for parameters and examples.
 ## Design
 
 See [DESIGN.md](DESIGN.md) for the module's architecture, the bugs found and fixed during its
-rewrite, and the reasoning behind its API shape.
+rewrite, and the reasoning behind its API shape. See [LESSONS-LEARNED.md](LESSONS-LEARNED.md)
+for recurring bugs and failure points hit along the way - check it before debugging something
+that feels like it should already work.
 
 ## License
 
