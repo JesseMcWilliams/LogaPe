@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-28
+
 ### Added
 - `Examples/` folder: 7 runnable, self-contained scripts covering the main feature areas
   (getting started, multiple loggers & independent levels, rotation/retention, structured JSON
