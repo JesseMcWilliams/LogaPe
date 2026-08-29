@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioning follows [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `Examples/` folder: 7 runnable, self-contained scripts covering the main feature areas
+  (getting started, multiple loggers & independent levels, rotation/retention, structured JSON
+  logging, exception handling, tailing, and the Event Log sink). Each imports the module
+  directly from the repo and writes only under `$env:TEMP`. They're deliberately assertion-free
+  - `Tests/Examples.Tests.ps1` smoke-tests them (each one just needs to run to completion
+  without error, as its own Windows PowerShell 5.1 process) so they don't silently rot as the
+  API evolves, while behavior assertions stay in `LogaPe.Tests.ps1`.
+
+### Fixed
+- `PSScriptAnalyzerSettings.psd1`'s `PSAvoidUsingWriteHost` suppression was a no-op: that rule
+  doesn't honor `Rules.<Name>.Enable`, so it appeared to work for the module purely because
+  `Write-Host` calls inside class methods are a separate analyzer blind spot, not because the
+  setting did anything - confirmed once the same settings file was pointed at `Examples/`'s
+  plain top-level script code and the rule fired anyway. Fixed by moving it to the top-level
+  `ExcludeRules` list, the mechanism actually verified to work for this rule.
+
 ## [0.3.0] - 2026-08-28
 
 ### Added

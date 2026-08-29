@@ -98,8 +98,20 @@ and every `Describe`/`Context`/`It` *call* to register the test tree, but not `I
 **Run** (actually executes `BeforeAll`/`BeforeEach`/`It` bodies, later, in a different
 scope/session). A bare top-level `$x = ...` only exists during Discovery.
 
-**Rule:** Compute anything an `It`/`BeforeAll` needs - especially `$PSScriptRoot`-derived paths
-- *inside* `BeforeAll`, assigned to `$script:something`, not at the top of the file.
+**Rule:** Compute anything a plain `It`/`BeforeAll` needs - especially `$PSScriptRoot`-derived
+paths - *inside* `BeforeAll` itself, assigned to `$script:something`.
+
+**Caught this exact bug again, more precisely, while building `Tests/Examples.Tests.ps1`:**
+a bare `$exampleScripts = Get-ChildItem ...` at the top of a `Describe` block worked fine as the
+data source for `It -ForEach $exampleScripts` (because `-ForEach`'s argument is itself evaluated
+during Discovery, when that top-level code runs) - but a plain `It` elsewhere in the *same*
+`Describe`, reading that same variable, saw it as empty. The instinctive fix,
+`$script:exampleScripts = ...` at that same top level, **did not help** - it still read as empty
+inside the plain `It`. What actually worked was moving the assignment into a `BeforeAll` block
+(`$script:exampleScripts = Get-ChildItem ...` *inside* `BeforeAll`). So the rule isn't just
+"use `$script:` scope" - it's specifically "assign it inside `BeforeAll`," full stop. A
+Discovery-time top-level variable is fine to keep using directly as `-ForEach`'s argument (that
+part isn't broken), just don't expect a plain `It` in the same file to see it, `$script:` or not.
 
 ### Testing `-Wait`/`tail -f`-style streaming needs a background runspace, not a sleep-and-check
 
@@ -121,6 +133,43 @@ control in tests, assert on the parts that don't vary: registration/listing/remo
 that filtering means the code path is never reached at all below a threshold, and that a write
 attempt never throws back to the caller regardless of whether it internally succeeded or
 failed-and-warned. Don't assert on which of those two outcomes occurred.
+
+## PSScriptAnalyzer / Linting
+
+### `Rules.<RuleName>.Enable = $false` in a settings file does not disable every rule - some silently ignore it
+
+**Symptom:** `PSScriptAnalyzerSettings.psd1` had `Rules.PSAvoidUsingWriteHost.Enable = $false`
+with a comment claiming it suppressed the rule for the module. It appeared to work (0 findings)
+- until the same settings file was pointed at `Examples/*.ps1` (plain top-level script code,
+not class methods) and `PSAvoidUsingWriteHost` fired anyway, on every single `Write-Host` call,
+completely ignoring the setting.
+
+**Root cause, verified directly:** `PSAvoidUsingWriteHost` never actually respected
+`Rules.PSAvoidUsingWriteHost.Enable` at all in the installed PSScriptAnalyzer version - a scan
+with *no settings file whatsoever* already showed 0 findings for it against the module, because
+`Write-Host` calls inside PowerShell class methods (`WriteConsole`/`WriteNativeStream`) are a
+separate blind spot for this analyzer (same family of issue as the class-method false positive
+below). The "suppression" was never doing anything; it just never had anything to suppress in
+that particular file. Meanwhile `Rules.PSAvoidOverwritingBuiltInCmdlets.Enable = $false`,
+tested the same way, *does* genuinely suppress real findings (3 findings with no settings, 0
+with it) - so this isn't "the whole `Rules.Enable` mechanism is broken," it's rule-specific.
+
+**Rule:** Don't trust that a `Rules.<Name>.Enable = $false` entry works just because a scan
+comes back clean - that clean result might mean the rule was never going to fire there anyway.
+Verify any new suppression by running a scan with *no settings file* first, to see the rule
+actually fire, then confirm the settings file makes it disappear. For `PSAvoidUsingWriteHost`
+specifically (and possibly other simple non-configurable rules), use the top-level
+`ExcludeRules = @('RuleName')` list instead - that's the mechanism verified to actually work
+for it.
+
+### Class-method names can trigger false positives in rules that expect Verb-Noun function names
+
+`PSAvoidOverwritingBuiltInCmdlets` flagged `Name` and `WriteFile` - not functions, but ordinary
+methods on `LoggingLevel`/`LoggingObject` classes - as if they were shadowing built-in cmdlets
+of the same name. PSScriptAnalyzer's parsing of `class` bodies isn't as complete as its parsing
+of top-level functions; expect occasional false positives tied to method names, distinct from
+genuine findings on actual exported functions (like the real `Write-Log` naming choice flagged
+by the same rule, which is not a false positive and is suppressed for a different reason).
 
 ## Design bugs worth remembering (root causes, not just the fix)
 

@@ -33,6 +33,8 @@ Write-Log 'Cache miss, falling back to source' -Level Warning
 Write-Log 'Unhandled exception in worker thread' -Level Error
 ```
 
+See [Examples/](Examples/) for runnable scripts covering every feature below in more depth.
+
 By default, `New-Logger` writes console-only and names the log file after the calling script
 (`<yyyy-MM-dd>_<script name>.log`) in the script's own folder. Use `-FileName`, `-Folder`, and
 `-Destination` to override.
