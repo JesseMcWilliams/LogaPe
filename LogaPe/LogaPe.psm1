@@ -89,6 +89,26 @@ class LoggingSink
     }
 }
 
+# A regex-based scrub rule applied to message text before it reaches any destination or
+# sink. -Pattern can mark a literal prefix (e.g. 'password=') to keep unmasked with a named
+# '(?<Prefix>...)' group - MaskMessage() preserves that group's text and replaces only the
+# rest of the match. Without a 'Prefix' group, the entire match is replaced.
+class MaskRule
+{
+    [string] $Id
+    [string] $Pattern
+    [string] $Replacement
+    hidden [regex] $Regex
+
+    MaskRule([string]$Pattern, [string]$Replacement)
+    {
+        $this.Id = [guid]::NewGuid().ToString()
+        $this.Pattern = $Pattern
+        $this.Replacement = $Replacement
+        $this.Regex = [regex]::new($Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
+}
+
 class LoggingObject
 {
     hidden [string] $LoggingFile
@@ -379,6 +399,9 @@ class Logger
     hidden [string] $TimestampFormat = 'yyyy-MM-dd HH:mm:ss'
     hidden [bool] $UseNativeStreams = $false
     hidden [System.Collections.Generic.List[LoggingSink]] $Sinks = [System.Collections.Generic.List[LoggingSink]]::new()
+    hidden [System.Collections.Generic.List[MaskRule]] $MaskRules = [System.Collections.Generic.List[MaskRule]]::new()
+    hidden [System.Collections.Generic.List[string]] $MaskedFieldNames = [System.Collections.Generic.List[string]]::new()
+    hidden [string] $MaskReplacement = '***'
 
     [LoggingDestination] $LogDestination
 
@@ -500,6 +523,104 @@ class Logger
         return $this.Sinks
     }
 
+    [string]AddMaskRule([string]$Pattern, [string]$Replacement)
+    {
+        $rule = [MaskRule]::new($Pattern, $Replacement)
+        $this.MaskRules.Add($rule)
+        return $rule.Id
+    }
+
+    [void]RemoveMaskRule([string]$Id)
+    {
+        $match = $this.MaskRules | Where-Object { $_.Id -eq $Id }
+        if ($match)
+        {
+            [void]$this.MaskRules.Remove($match)
+        }
+    }
+
+    [System.Collections.Generic.List[MaskRule]]GetMaskRules()
+    {
+        return $this.MaskRules
+    }
+
+    [void]AddMaskField([string]$FieldName)
+    {
+        foreach ($name in $this.MaskedFieldNames)
+        {
+            if ($name -ieq $FieldName)
+            {
+                return
+            }
+        }
+        $this.MaskedFieldNames.Add($FieldName)
+    }
+
+    [void]RemoveMaskField([string]$FieldName)
+    {
+        $matchingNames = @($this.MaskedFieldNames | Where-Object { $_ -ieq $FieldName })
+        foreach ($name in $matchingNames)
+        {
+            [void]$this.MaskedFieldNames.Remove($name)
+        }
+    }
+
+    [string[]]GetMaskFields()
+    {
+        return $this.MaskedFieldNames.ToArray()
+    }
+
+    [void]SetMaskReplacement([string]$Replacement)
+    {
+        $this.MaskReplacement = $Replacement
+    }
+
+    [string]GetMaskReplacement()
+    {
+        return $this.MaskReplacement
+    }
+
+    # Applied to the fully-assembled message (including any -ErrorRecord/-Exception detail)
+    # before FormatMessage builds Text/Json output, so every destination and sink sees the
+    # same scrubbed text.
+    hidden [string]MaskMessage([string]$Text)
+    {
+        if ($this.MaskRules.Count -eq 0 -or -not $Text)
+        {
+            return $Text
+        }
+
+        foreach ($rule in $this.MaskRules)
+        {
+            $replacement = if ($rule.Replacement) { $rule.Replacement } else { $this.MaskReplacement }
+            $evaluator = [System.Text.RegularExpressions.MatchEvaluator] {
+                param($match)
+                $prefixGroup = $match.Groups['Prefix']
+                if ($prefixGroup.Success)
+                {
+                    return $prefixGroup.Value + $replacement
+                }
+                return $replacement
+            }
+            $Text = $rule.Regex.Replace($Text, $evaluator)
+        }
+        return $Text
+    }
+
+    # Replaces a -Fields value wholesale when its key is on the masked-field list, regardless
+    # of the value's original type - more reliable than a text regex for structured values.
+    hidden [object]MaskFieldValue([string]$Key, [object]$Value)
+    {
+        foreach ($name in $this.MaskedFieldNames)
+        {
+            if ($name -ieq $Key)
+            {
+                return $this.MaskReplacement
+            }
+        }
+        return $Value
+    }
+
     [void]SetLoggingPath([string]$FolderPath)
     {
         if ([System.IO.Path]::IsPathRooted($FolderPath))
@@ -570,6 +691,8 @@ class Logger
                "`r`n`tDestination  | $($this.LogDestination.LogDestination)" +
                "`r`n`tOutputFormat | $($this.OutputFormat)" +
                "`r`n`tSinks        | $($this.Sinks.Count)" +
+               "`r`n`tMaskRules    | $($this.MaskRules.Count)" +
+               "`r`n`tMaskFields   | $($this.MaskedFieldNames.Count)" +
                "`r`n`tMutexName    | $($this.LogFileObj.GetLoggingMutexName())"
     }
 
@@ -638,6 +761,8 @@ class Logger
 
     hidden [string]FormatMessage([string]$Message, [LoggingLevel]$Level, [bool]$Bare, [hashtable]$Fields)
     {
+        $maskedMessage = $this.MaskMessage($Message)
+
         if ($this.OutputFormat -eq 'Json')
         {
             $record = [ordered]@{}
@@ -646,13 +771,13 @@ class Logger
                 $record['Timestamp'] = Get-Date -Format $this.TimestampFormat
                 $record['Level'] = $Level.Name()
             }
-            $record['Message'] = $Message
+            $record['Message'] = $maskedMessage
 
             if ($Fields)
             {
                 foreach ($key in $Fields.Keys)
                 {
-                    $record[$key] = $Fields[$key]
+                    $record[$key] = $this.MaskFieldValue($key, $Fields[$key])
                 }
             }
 
@@ -661,19 +786,19 @@ class Logger
 
         if ($Bare)
         {
-            $text = $Message
+            $text = $maskedMessage
         }
         else
         {
             $text = $this.MessageFormat.
                 Replace('{Timestamp}', (Get-Date -Format $this.TimestampFormat)).
                 Replace('{Level}', $Level.Name().PadLeft(11, ' ')).
-                Replace('{Message}', $Message)
+                Replace('{Message}', $maskedMessage)
         }
 
         if ($Fields)
         {
-            $fieldText = ($Fields.Keys | ForEach-Object { "$_=$($Fields[$_])" }) -join ', '
+            $fieldText = ($Fields.Keys | ForEach-Object { "$_=$($this.MaskFieldValue($_, $Fields[$_]))" }) -join ', '
             $text = "$text | $fieldText"
         }
 
@@ -2044,6 +2169,323 @@ function Remove-LoggerSink
     }
 }
 
+function Add-LoggerMaskRule
+{
+    <#
+    .SYNOPSIS
+    Adds a regex-based masking rule that scrubs sensitive values out of logged message text.
+
+    .DESCRIPTION
+    Applied to every message (including any -ErrorRecord/-Exception detail) before it's
+    written to any destination or sink, regardless of -OutputFormat. To exclude a literal
+    prefix (e.g. 'password=') from being replaced, wrap it in a named '(?<Prefix>...)' group in
+    -Pattern - that group's text is preserved and only the remainder of the match is replaced.
+    Without a 'Prefix' group, the entire match is replaced.
+
+    To mask a named key in -Fields hashtables instead of free text, use Add-LoggerMaskField.
+    See also Add-LoggerDefaultMaskRule for a ready-made preset covering common secrets.
+
+    .PARAMETER Pattern
+    A .NET regex (matched case-insensitively). Whatever it matches is replaced by
+    -Replacement, except for the text captured by an optional named '(?<Prefix>...)' group.
+
+    .PARAMETER Replacement
+    Text to substitute for each match (after any 'Prefix' group). Defaults to the logger's
+    mask replacement (see Set-LoggerMaskReplacement, itself defaulting to '***').
+
+    .PARAMETER Logger
+    The Logger instance to add this rule to. Defaults to the active logger.
+
+    .EXAMPLE
+    Add-LoggerMaskRule -Pattern '(?i)(?<Prefix>password\s*[:=]\s*)\S+'
+
+    .OUTPUTS
+    System.String - the new rule's Id, for use with Remove-LoggerMaskRule.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [string]$Pattern,
+
+        [Parameter()]
+        [string]$Replacement,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Add mask rule for pattern '$Pattern'"))
+    {
+        $target.AddMaskRule($Pattern, $Replacement)
+    }
+}
+
+function Get-LoggerMaskRule
+{
+    <#
+    .SYNOPSIS
+    Lists the message-text masking rules registered on a logger.
+
+    .PARAMETER Logger
+    The Logger instance to query. Defaults to the active logger.
+
+    .EXAMPLE
+    Get-LoggerMaskRule
+
+    .OUTPUTS
+    A [pscustomobject] per rule, with Id, Pattern, and Replacement.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    foreach ($rule in $target.GetMaskRules())
+    {
+        [pscustomobject]@{
+            Id          = $rule.Id
+            Pattern     = $rule.Pattern
+            Replacement = if ($rule.Replacement) { $rule.Replacement } else { $target.GetMaskReplacement() }
+        }
+    }
+}
+
+function Remove-LoggerMaskRule
+{
+    <#
+    .SYNOPSIS
+    Removes a masking rule previously added with Add-LoggerMaskRule.
+
+    .PARAMETER Id
+    The rule's Id, as returned by Add-LoggerMaskRule or from Get-LoggerMaskRule.
+
+    .PARAMETER Logger
+    The Logger instance to remove it from. Defaults to the active logger.
+
+    .EXAMPLE
+    $ruleId = Add-LoggerMaskRule -Pattern '(?i)password\s*[:=]\s*\K\S+'
+    Remove-LoggerMaskRule -Id $ruleId
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [string]$Id,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Remove mask rule '$Id'"))
+    {
+        $target.RemoveMaskRule($Id)
+    }
+}
+
+function Add-LoggerMaskField
+{
+    <#
+    .SYNOPSIS
+    Marks a -Fields key (see Write-Log) as sensitive, so its value is always masked.
+
+    .DESCRIPTION
+    Unlike Add-LoggerMaskRule, which pattern-matches free text, this replaces the entire value
+    of any -Fields entry whose key matches -FieldName (case-insensitive) - in both 'Text' and
+    'Json' output. Useful for structured values like `-Fields @{ Password = $plainText }` that
+    a text regex could miss depending on formatting.
+
+    .PARAMETER FieldName
+    The -Fields key to mask (case-insensitive). Adding a name that's already masked is a
+    no-op.
+
+    .PARAMETER Logger
+    The Logger instance to update. Defaults to the active logger.
+
+    .EXAMPLE
+    Add-LoggerMaskField -FieldName Password
+    Write-Log 'login attempt' -Fields @{ Password = $plainText }
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [string]$FieldName,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Mask field '$FieldName'"))
+    {
+        $target.AddMaskField($FieldName)
+    }
+}
+
+function Get-LoggerMaskField
+{
+    <#
+    .SYNOPSIS
+    Lists the -Fields key names being masked on a logger.
+
+    .PARAMETER Logger
+    The Logger instance to query. Defaults to the active logger.
+
+    .OUTPUTS
+    System.String[]
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Position = 0)]
+        [Logger]$Logger
+    )
+
+    (Resolve-TargetLogger -Logger $Logger).GetMaskFields()
+}
+
+function Remove-LoggerMaskField
+{
+    <#
+    .SYNOPSIS
+    Stops masking a -Fields key previously added with Add-LoggerMaskField.
+
+    .PARAMETER FieldName
+    The field name to stop masking (case-insensitive).
+
+    .PARAMETER Logger
+    The Logger instance to update. Defaults to the active logger.
+
+    .EXAMPLE
+    Remove-LoggerMaskField -FieldName Password
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [string]$FieldName,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Unmask field '$FieldName'"))
+    {
+        $target.RemoveMaskField($FieldName)
+    }
+}
+
+function Get-LoggerMaskReplacement
+{
+    <#
+    .SYNOPSIS
+    Gets a logger's default mask replacement text.
+
+    .PARAMETER Logger
+    The Logger instance to query. Defaults to the active logger.
+
+    .OUTPUTS
+    System.String
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Position = 0)]
+        [Logger]$Logger
+    )
+
+    (Resolve-TargetLogger -Logger $Logger).GetMaskReplacement()
+}
+
+function Set-LoggerMaskReplacement
+{
+    <#
+    .SYNOPSIS
+    Sets the text substituted for masked values.
+
+    .DESCRIPTION
+    Used by Add-LoggerMaskField, and by any Add-LoggerMaskRule that didn't specify its own
+    -Replacement. Defaults to '***'.
+
+    .PARAMETER Replacement
+    The replacement text.
+
+    .PARAMETER Logger
+    The Logger instance to update. Defaults to the active logger.
+
+    .EXAMPLE
+    Set-LoggerMaskReplacement -Replacement '[REDACTED]'
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [string]$Replacement,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Set mask replacement to '$Replacement'"))
+    {
+        $target.SetMaskReplacement($Replacement)
+    }
+}
+
+function Add-LoggerDefaultMaskRule
+{
+    <#
+    .SYNOPSIS
+    Adds a curated set of masking rules/fields covering common secrets (passwords, tokens,
+    API keys, connection strings).
+
+    .DESCRIPTION
+    A convenience preset over Add-LoggerMaskRule/Add-LoggerMaskField for the common case of
+    "don't let credentials reach the log". Covers 'key=value', 'key: value', and
+    '"key": "value"' style text (e.g. 'password=hunter2', '"apiKey": "abc123"') as well as
+    -Fields keys named Password, Pwd, Secret, Token, ApiKey, or ConnectionString.
+
+    Review Get-LoggerMaskRule/Get-LoggerMaskField afterwards, and add more with
+    Add-LoggerMaskRule/Add-LoggerMaskField for anything specific to your application that this
+    preset doesn't cover.
+
+    .PARAMETER Logger
+    The Logger instance to update. Defaults to the active logger.
+
+    .EXAMPLE
+    Add-LoggerDefaultMaskRule
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Position = 0)]
+        [Logger]$Logger
+    )
+
+    $target = Resolve-TargetLogger -Logger $Logger
+    if (-not $PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), 'Add default mask rules'))
+    {
+        return
+    }
+
+    $keywords = 'password', 'pwd', 'secret', 'token', 'apikey', 'api_key', 'connectionstring'
+    foreach ($keyword in $keywords)
+    {
+        # Matches key=value / key: value / "key": "value" text. The 'Prefix' group covers the
+        # key, separator, and any opening quote, so only the value itself gets replaced.
+        $pattern = '(?i)(?<Prefix>"?' + $keyword + '"?\s*[:=]\s*"?)[^\s",}]+'
+        $target.AddMaskRule($pattern, $null)
+    }
+
+    $fields = 'Password', 'Pwd', 'Secret', 'Token', 'ApiKey', 'ConnectionString'
+    foreach ($field in $fields)
+    {
+        $target.AddMaskField($field)
+    }
+}
+
 function Write-Log
 {
     <#
@@ -2200,4 +2642,13 @@ Export-ModuleMember -Function @(
     'Set-LoggerMessageFormat'
     'Get-LoggerNativeStreamMode'
     'Set-LoggerNativeStreamMode'
+    'Add-LoggerMaskRule'
+    'Get-LoggerMaskRule'
+    'Remove-LoggerMaskRule'
+    'Add-LoggerMaskField'
+    'Get-LoggerMaskField'
+    'Remove-LoggerMaskField'
+    'Get-LoggerMaskReplacement'
+    'Set-LoggerMaskReplacement'
+    'Add-LoggerDefaultMaskRule'
 )

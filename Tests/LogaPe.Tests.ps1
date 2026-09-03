@@ -308,6 +308,94 @@ Describe 'LogaPe' {
         }
     }
 
+    Context 'Masking' {
+        It 'masks a message-text pattern added via Add-LoggerMaskRule, keeping the prefix intact' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-rule.log' -UseFileNameAsIs -Destination File
+            Add-LoggerMaskRule -Pattern '(?i)(?<Prefix>password\s*[:=]\s*)\S+' -Logger $logger
+
+            Write-Log 'login with password=hunter2' -Logger $logger -Bare
+
+            $content = Get-Content (Get-LoggerFullPath -Logger $logger) -Raw
+            $content | Should -Match 'password=\*\*\*'
+            $content | Should -Not -Match 'hunter2'
+        }
+
+        It 'masks a -Fields value whose key was added via Add-LoggerMaskField, in Text output' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-field-text.log' -UseFileNameAsIs -Destination File
+            Add-LoggerMaskField -FieldName Password -Logger $logger
+
+            Write-Log 'login attempt' -Logger $logger -Fields @{ Password = 'hunter2'; UserId = 42 }
+
+            $content = Get-Content (Get-LoggerFullPath -Logger $logger) -Raw
+            $content | Should -Match 'Password=\*\*\*'
+            $content | Should -Match 'UserId=42'
+            $content | Should -Not -Match 'hunter2'
+        }
+
+        It 'masks a -Fields value whose key was added via Add-LoggerMaskField, in Json output' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-field-json.log' -UseFileNameAsIs -Destination File -OutputFormat Json
+            Add-LoggerMaskField -FieldName Password -Logger $logger
+
+            Write-Log 'login attempt' -Logger $logger -Fields @{ Password = 'hunter2'; UserId = 42 }
+
+            $parsed = (Get-Content (Get-LoggerFullPath -Logger $logger) -Raw) | ConvertFrom-Json
+            $parsed.Password | Should -Be '***'
+            $parsed.UserId | Should -Be 42
+        }
+
+        It 'uses a custom replacement set via Set-LoggerMaskReplacement' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-replacement.log' -UseFileNameAsIs -Destination File
+            Set-LoggerMaskReplacement -Replacement '[REDACTED]' -Logger $logger
+            Add-LoggerMaskField -FieldName Secret -Logger $logger
+
+            Write-Log 'token issued' -Logger $logger -Fields @{ Secret = 'topsecret' }
+
+            (Get-Content (Get-LoggerFullPath -Logger $logger) -Raw) | Should -Match 'Secret=\[REDACTED\]'
+        }
+
+        It 'Add-LoggerDefaultMaskRule masks common password/token patterns and fields out of the box' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-default.log' -UseFileNameAsIs -Destination File
+            Add-LoggerDefaultMaskRule -Logger $logger
+
+            Write-Log 'connecting with password=hunter2 and apiKey=abc123' -Logger $logger -Bare
+            Write-Log 'login attempt' -Logger $logger -Fields @{ Token = 'xyz' }
+
+            $content = Get-Content (Get-LoggerFullPath -Logger $logger) -Raw
+            $content | Should -Not -Match 'hunter2'
+            $content | Should -Not -Match 'abc123'
+            $content | Should -Not -Match 'xyz'
+        }
+
+        It 'no longer masks a field after Remove-LoggerMaskField' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-field-remove.log' -UseFileNameAsIs -Destination File
+            Add-LoggerMaskField -FieldName Password -Logger $logger
+            Remove-LoggerMaskField -FieldName Password -Logger $logger
+
+            Write-Log 'login attempt' -Logger $logger -Fields @{ Password = 'hunter2' }
+
+            (Get-Content (Get-LoggerFullPath -Logger $logger) -Raw) | Should -Match 'hunter2'
+        }
+
+        It 'no longer applies a rule after Remove-LoggerMaskRule' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-rule-remove.log' -UseFileNameAsIs -Destination File
+            $ruleId = Add-LoggerMaskRule -Pattern '(?i)(?<Prefix>password\s*[:=]\s*)\S+' -Logger $logger
+            Remove-LoggerMaskRule -Id $ruleId -Logger $logger
+
+            Write-Log 'login with password=hunter2' -Logger $logger -Bare
+
+            (Get-Content (Get-LoggerFullPath -Logger $logger) -Raw) | Should -Match 'hunter2'
+        }
+
+        It 'Get-LoggerMaskRule and Get-LoggerMaskField reflect what was added' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-get.log' -UseFileNameAsIs -Destination File
+            Add-LoggerMaskRule -Pattern '(?i)(?<Prefix>password\s*[:=]\s*)\S+' -Logger $logger | Out-Null
+            Add-LoggerMaskField -FieldName Password -Logger $logger
+
+            (Get-LoggerMaskRule -Logger $logger).Pattern | Should -Match 'password'
+            Get-LoggerMaskField -Logger $logger | Should -Contain 'Password'
+        }
+    }
+
     Context 'Concurrent writes' {
         It 'serializes writes from multiple runspaces without losing or interleaving lines' {
             $logger = New-Logger -Folder $script:LogFolder -FileName 'concurrent.log' -UseFileNameAsIs -Destination File -TimeoutSeconds 10
