@@ -394,6 +394,53 @@ Describe 'LogaPe' {
             (Get-LoggerMaskRule -Logger $logger).Pattern | Should -Match 'password'
             Get-LoggerMaskField -Logger $logger | Should -Contain 'Password'
         }
+
+        It 'a wildcard field pattern masks any key that matches it' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-field-wildcard.log' -UseFileNameAsIs -Destination File
+            Add-LoggerMaskField -FieldName '*token*' -Logger $logger
+
+            Write-Log 'refreshed' -Logger $logger -Fields @{ AccessToken = 'abc123'; UserId = 7 }
+
+            $content = Get-Content (Get-LoggerFullPath -Logger $logger) -Raw
+            $content | Should -Match 'AccessToken=\*\*\*'
+            $content | Should -Match 'UserId=7'
+            $content | Should -Not -Match 'abc123'
+        }
+
+        It 'a plain (non-wildcard) field name only matches that exact key' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-field-exact.log' -UseFileNameAsIs -Destination File
+            Add-LoggerMaskField -FieldName Token -Logger $logger
+
+            Write-Log 'refreshed' -Logger $logger -Fields @{ AccessToken = 'abc123' }
+
+            (Get-Content (Get-LoggerFullPath -Logger $logger) -Raw) | Should -Match 'abc123'
+        }
+
+        It 'New-Logger -EnableDefaultMasking applies the default preset at creation time' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-enable-default.log' -UseFileNameAsIs -Destination File -EnableDefaultMasking
+
+            Write-Log 'connecting with password=hunter2' -Logger $logger -Bare
+            Write-Log 'refreshed' -Logger $logger -Fields @{ AccessToken = 'abc123' }
+
+            $content = Get-Content (Get-LoggerFullPath -Logger $logger) -Raw
+            $content | Should -Not -Match 'hunter2'
+            $content | Should -Not -Match 'abc123'
+        }
+
+        It 'Write-Log -SkipMasking bypasses masking for that call only' {
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'mask-skip.log' -UseFileNameAsIs -Destination File
+            Add-LoggerMaskField -FieldName Password -Logger $logger
+            Add-LoggerMaskRule -Pattern '(?i)(?<Prefix>password\s*[:=]\s*)\S+' -Logger $logger
+
+            Write-Log 'password=hunter2' -Logger $logger -Bare -SkipMasking
+            Write-Log 'masked attempt' -Logger $logger -Fields @{ Password = 'hunter2' } -SkipMasking
+            Write-Log 'password=hunter2' -Logger $logger -Bare
+
+            $lines = Get-Content (Get-LoggerFullPath -Logger $logger)
+            $lines[0] | Should -Match 'hunter2'
+            $lines[1] | Should -Match 'hunter2'
+            $lines[2] | Should -Match '\*\*\*'
+        }
     }
 
     Context 'Concurrent writes' {

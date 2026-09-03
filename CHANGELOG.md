@@ -16,7 +16,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
   `Set-LoggerMaskReplacement` control the substituted text (default `'***'`).
   `Add-LoggerDefaultMaskRule` adds a ready-made preset covering common secret keywords
   (password, pwd, secret, token, apikey/api_key, connectionstring) as both text patterns and
-  masked fields. See [USAGE.md](USAGE.md#masking-sensitive-values) and
+  wildcard-matched masked fields (e.g. `AccessToken` and `DbPassword` are covered, not just
+  exact keyword matches - `Add-LoggerMaskField -FieldName` now supports wildcards generally,
+  e.g. `'*token*'`). `New-Logger -EnableDefaultMasking` applies the same preset at creation
+  time. `Write-Log -SkipMasking` bypasses masking for one call, without altering the logger's
+  registered rules/fields. See [USAGE.md](USAGE.md#masking-sensitive-values) and
   [DESIGN.md](DESIGN.md#11-masking-v050) for details.
 - `USAGE.md`: a dedicated usage guide with a full walkthrough of every feature and the
   function reference, split out of `README.md` to keep the README a short overview.
