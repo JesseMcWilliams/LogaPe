@@ -1,7 +1,7 @@
 # LogaPe — Design Document
 
-Status: **Implemented** (v0.1.0). See §10 for what shipped, including a folder-layout change
-and extra fixes discovered while building it.
+Status: **Implemented** (v0.1.0 through v0.5.0). §1-9 cover the original module rewrite; §10
+records what shipped for that rewrite. §11 covers the masking feature added in v0.5.0.
 
 ## 1. Purpose
 
@@ -252,3 +252,93 @@ file, *outside* any `Describe`/`Context`/`It` block, is only visible during Pest
 Discovery phase — it reads as unset inside `BeforeAll`/`It` blocks, which run later in the
 Run phase. The manifest path is instead computed inside `BeforeAll` itself
 (`$script:ModuleManifest = Join-Path $PSScriptRoot ...`).
+
+## 11. Masking (v0.5.0)
+
+### Motivation
+
+Nothing stopped a caller from writing a plaintext password, API key, or connection string
+into a log line via `Write-Log` or `-Fields` — the message and field values were written
+verbatim. Masking lets a logger scrub sensitive values before they ever reach a destination,
+without requiring every call site to remember to redact its own arguments.
+
+### Design goals
+
+- **Uniform across every output path.** A masked value shouldn't leak through the console just
+  because the file happened to be scrubbed, or through `Json` mode because a rule was written
+  against `Text` formatting. Masking needed to apply once, upstream of all of it.
+- **Two different shapes of "sensitive."** Free text (`"password=hunter2"` inside a message
+  string) and structured data (`-Fields @{ Password = $plainText }`) need different matching
+  strategies — a regex over free text is the wrong tool for a hashtable value, and a field-name
+  check can't see inside an arbitrary message string.
+- **Opt-in, like the rest of the module's extras.** Rotation, sinks, and native streams are all
+  off until configured; masking follows the same pattern rather than silently rewriting output
+  by default. A ready-made preset (`Add-LoggerDefaultMaskRule`) exists for the common case, but
+  nothing is masked until a rule or field is registered.
+
+### Injection point
+
+`Logger._WriteOutput()` is the one place every write already converges — console, file, and
+every active sink all receive the same string built by `Logger.FormatMessage()`. Masking the
+message and `-Fields` values *inside* `FormatMessage`, before the `Text`/`Json` branch, means
+every destination and sink is scrubbed identically with no per-destination duplication, and it
+covers `-ErrorRecord`/`-Exception` detail too since `Write-Log` folds those into the message
+before `Write()` is ever called.
+
+### Two masking mechanisms
+
+- **`MaskRule`** (`Add-LoggerMaskRule`) — a case-insensitive .NET regex applied to the message
+  text. A named `(?<Prefix>...)` group is optional: if present, that portion of the match is
+  preserved and only the remainder is replaced (e.g. keeping `password=` visible while masking
+  the value after it); without it, the whole match is replaced.
+- **Masked field names** (`Add-LoggerMaskField`) — a case-insensitive list of `-Fields` keys
+  (e.g. `Password`, `Token`) whose value is replaced wholesale, regardless of type, in both
+  `Text`'s `key=value` output and `Json`'s object properties. This is more reliable than a text
+  regex for structured values, since it doesn't depend on how the value happens to serialize.
+
+Both share a single logger-level replacement token (`Set-LoggerMaskReplacement`, default
+`'***'`); an individual `Add-LoggerMaskRule` call can override it per-rule.
+
+### Why not `\K`?
+
+The first implementation used PCRE's `\K` ("keep") to exclude a literal prefix like
+`password=` from the match, e.g. `(?i)password\s*[:=]\s*\K\S+`. PowerShell's regex engine is
+.NET's `System.Text.RegularExpressions`, which does **not** support `\K` — this only surfaced
+once the Pester suite actually exercised `Add-LoggerMaskRule` (`ArgumentException: ... 
+Unrecognized escape sequence \K`), not from a static read of the pattern. The fix was the
+named `(?<Prefix>...)` group described above, applied via `Regex.Replace(string,
+MatchEvaluator)` (a PowerShell scriptblock cast to `[System.Text.RegularExpressions.
+MatchEvaluator]`) so the prefix group's text can be re-emitted ahead of the replacement token.
+
+### API shape
+
+Follows the existing `Add-Logger*Sink`/`Get-Logger*`/`Remove-Logger*` conventions (each
+function accepts an optional `-Logger`, defaults to the active logger, and mutating functions
+support `-WhatIf`/`-Confirm`):
+
+| Function | Purpose |
+|---|---|
+| `Add-LoggerMaskRule` / `Get-LoggerMaskRule` / `Remove-LoggerMaskRule` | Regex-based message-text masking |
+| `Add-LoggerMaskField` / `Get-LoggerMaskField` / `Remove-LoggerMaskField` | `-Fields` key-based masking |
+| `Get-LoggerMaskReplacement` / `Set-LoggerMaskReplacement` | The default replacement token |
+| `Add-LoggerDefaultMaskRule` | Preset: password/pwd/secret/token/apikey/connectionstring, as both text patterns and masked fields |
+
+`Add-LoggerDefaultMaskRule` (not `-Rules`) is deliberately singular, per `PSScriptAnalyzer`'s
+`PSUseSingularNouns` — it's a single logical action ("add the default rule set"), matching
+this module's existing verb-noun conventions even though it registers multiple rules under
+the hood.
+
+### PSScriptAnalyzer follow-ups
+
+- `PSUseSingularNouns` flagged the initial `Add-LoggerDefaultMaskRules` name — renamed to
+  `Add-LoggerDefaultMaskRule` (see above) rather than suppressed.
+- `PSAvoidAssignmentToAutomaticVariable` flagged a local `$matches` variable in
+  `Logger.RemoveMaskField()` (PowerShell's regex-match automatic variable) — renamed to
+  `$matchingNames`.
+
+### Test coverage
+
+`Tests/LogaPe.Tests.ps1`'s `Masking` context covers: a message-text rule preserving its prefix,
+field masking in both `Text` and `Json` output, a custom replacement token, the
+`Add-LoggerDefaultMaskRule` preset, and that `Remove-LoggerMaskRule`/`Remove-LoggerMaskField`
+actually stop masking.
