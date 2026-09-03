@@ -163,10 +163,18 @@ Write-Log "connecting with password=$plainTextPassword"   # -> "connecting with 
 Write-Log 'login attempt' -Fields @{ Password = $plainTextPassword }   # -> Password=***
 ```
 
-`Add-LoggerDefaultMaskRule` covers `key=value`/`key: value`/`"key": "value"` text and
-`-Fields` keys for `password`, `pwd`, `secret`, `token`, `apikey`/`api_key`, and
-`connectionstring` (case-insensitive). Review what it added with `Get-LoggerMaskRule` /
-`Get-LoggerMaskField`, and layer on anything specific to your application.
+`Add-LoggerDefaultMaskRule` covers `key=value`/`key: value`/`"key": "value"` text and any
+`-Fields` key *containing* `password`, `pwd`, `secret`, `token`, `apikey`/`api_key`, or
+`connectionstring` (case-insensitive, wildcard-matched - see
+[Masking structured fields](#masking-structured-fields) - so `AccessToken` and
+`DbPassword` are covered too, not just exact matches). Review what it added with
+`Get-LoggerMaskRule` / `Get-LoggerMaskField`, and layer on anything specific to your
+application. To apply this preset automatically at creation time instead of calling it
+separately:
+
+```powershell
+New-Logger -Destination File -EnableDefaultMasking -SetActive
+```
 
 ### Masking free text
 
@@ -196,8 +204,28 @@ Write-Log 'login attempt' -Fields @{ Password = $plainTextPassword; UserId = 42 
 # Json:  {"Message":"login attempt","Password":"***","UserId":42}
 ```
 
-Field names match case-insensitively; `Remove-LoggerMaskField -FieldName Password` stops
-masking it.
+Field names match case-insensitively, and `-FieldName` accepts PowerShell wildcards - `'*
+token*'` matches `AccessToken`, `RefreshToken`, and `ApiTokenValue` without registering each
+one individually:
+
+```powershell
+Add-LoggerMaskField -FieldName '*token*'
+Write-Log 'refreshed' -Fields @{ AccessToken = $token }   # AccessToken -> ***
+```
+
+A plain name with no wildcard characters matches only that exact key. `Remove-LoggerMaskField
+-FieldName <pattern>` removes a pattern you added, by its exact literal text - not by
+re-evaluating which fields it currently matches.
+
+### Bypassing masking for one call
+
+`Write-Log -SkipMasking` writes that one message/`-Fields` unmasked, without touching the
+logger's registered rules or fields - useful when you deliberately need to see a real value
+while debugging:
+
+```powershell
+Write-Log 'raw token for debugging' -Fields @{ Token = $token } -SkipMasking
+```
 
 ### Customizing the replacement text
 

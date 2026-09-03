@@ -544,6 +544,9 @@ class Logger
         return $this.MaskRules
     }
 
+    # $FieldName may be a PowerShell wildcard pattern (e.g. '*token*'); stored and matched
+    # case-insensitively as-is. Adding a pattern already on the list (compared as literal
+    # text, not by what it currently matches) is a no-op.
     [void]AddMaskField([string]$FieldName)
     {
         foreach ($name in $this.MaskedFieldNames)
@@ -556,6 +559,8 @@ class Logger
         $this.MaskedFieldNames.Add($FieldName)
     }
 
+    # Removes a pattern previously passed to AddMaskField, matched as literal text - not a
+    # re-evaluation of which field names it currently matches.
     [void]RemoveMaskField([string]$FieldName)
     {
         $matchingNames = @($this.MaskedFieldNames | Where-Object { $_ -ieq $FieldName })
@@ -607,18 +612,37 @@ class Logger
         return $Text
     }
 
-    # Replaces a -Fields value wholesale when its key is on the masked-field list, regardless
-    # of the value's original type - more reliable than a text regex for structured values.
+    # Replaces a -Fields value wholesale when its key matches an entry on the masked-field
+    # list, regardless of the value's original type - more reliable than a text regex for
+    # structured values. Entries support PowerShell wildcards (e.g. '*token*'), matched
+    # case-insensitively; a plain name with no wildcard characters behaves as an exact match.
     hidden [object]MaskFieldValue([string]$Key, [object]$Value)
     {
-        foreach ($name in $this.MaskedFieldNames)
+        foreach ($pattern in $this.MaskedFieldNames)
         {
-            if ($name -ieq $Key)
+            if ($Key -ilike $pattern)
             {
                 return $this.MaskReplacement
             }
         }
         return $Value
+    }
+
+    # Registers the built-in preset of common secret keywords (password, pwd, secret, token,
+    # apikey/api_key, connectionstring) as both message-text rules and wildcard-matched
+    # -Fields entries. Factored out of Add-LoggerDefaultMaskRule so New-Logger
+    # -EnableDefaultMasking can apply the same preset at construction time.
+    [void]AddDefaultMaskRules()
+    {
+        $keywords = 'password', 'pwd', 'secret', 'token', 'apikey', 'api_key', 'connectionstring'
+        foreach ($keyword in $keywords)
+        {
+            # Matches key=value / key: value / "key": "value" text. The 'Prefix' group covers
+            # the key, separator, and any opening quote, so only the value itself is replaced.
+            $pattern = '(?i)(?<Prefix>"?' + $keyword + '"?\s*[:=]\s*"?)[^\s",}]+'
+            $this.AddMaskRule($pattern, $null)
+            $this.AddMaskField('*' + $keyword + '*')
+        }
     }
 
     [void]SetLoggingPath([string]$FolderPath)
@@ -696,29 +720,34 @@ class Logger
                "`r`n`tMutexName    | $($this.LogFileObj.GetLoggingMutexName())"
     }
 
-    # Method overloads collapse onto the 5-argument form so the level-filter check and the
+    # Method overloads collapse onto the 6-argument form so the level-filter check and the
     # write path each exist in exactly one place.
     [void]Write([string]$Message)
     {
-        $this.Write($Message, [LoggingLevel]::new('Information'), $this.LogDestination, $false, $null)
+        $this.Write($Message, [LoggingLevel]::new('Information'), $this.LogDestination, $false, $null, $false)
     }
 
     [void]Write([string]$Message, [LoggingLevel]$Level)
     {
-        $this.Write($Message, $Level, $this.LogDestination, $false, $null)
+        $this.Write($Message, $Level, $this.LogDestination, $false, $null, $false)
     }
 
     [void]Write([string]$Message, [LoggingLevel]$Level, [LoggingDestination]$Destination)
     {
-        $this.Write($Message, $Level, $Destination, $false, $null)
+        $this.Write($Message, $Level, $Destination, $false, $null, $false)
     }
 
     [void]Write([string]$Message, [LoggingLevel]$Level, [LoggingDestination]$Destination, [bool]$Bare)
     {
-        $this.Write($Message, $Level, $Destination, $Bare, $null)
+        $this.Write($Message, $Level, $Destination, $Bare, $null, $false)
     }
 
     [void]Write([string]$Message, [LoggingLevel]$Level, [LoggingDestination]$Destination, [bool]$Bare, [hashtable]$Fields)
+    {
+        $this.Write($Message, $Level, $Destination, $Bare, $Fields, $false)
+    }
+
+    [void]Write([string]$Message, [LoggingLevel]$Level, [LoggingDestination]$Destination, [bool]$Bare, [hashtable]$Fields, [bool]$SkipMasking)
     {
         $writeConsole = $Destination.Console() -and ($this.ConsoleLevel.Level() -le $Level.Level())
         $writeFile = $Destination.File() -and ($this.FileLevel.Level() -le $Level.Level())
@@ -729,12 +758,12 @@ class Logger
             return
         }
 
-        $this._WriteOutput($Message, $Level, $writeConsole, $writeFile, $Bare, $Fields, $activeSinks)
+        $this._WriteOutput($Message, $Level, $writeConsole, $writeFile, $Bare, $Fields, $activeSinks, $SkipMasking)
     }
 
-    hidden [void]_WriteOutput([string]$Message, [LoggingLevel]$Level, [bool]$WriteConsole, [bool]$WriteFile, [bool]$Bare, [hashtable]$Fields, [array]$ActiveSinks)
+    hidden [void]_WriteOutput([string]$Message, [LoggingLevel]$Level, [bool]$WriteConsole, [bool]$WriteFile, [bool]$Bare, [hashtable]$Fields, [array]$ActiveSinks, [bool]$SkipMasking)
     {
-        $formatted = $this.FormatMessage($Message, $Level, $Bare, $Fields)
+        $formatted = $this.FormatMessage($Message, $Level, $Bare, $Fields, $SkipMasking)
 
         if ($WriteConsole)
         {
@@ -759,9 +788,9 @@ class Logger
         }
     }
 
-    hidden [string]FormatMessage([string]$Message, [LoggingLevel]$Level, [bool]$Bare, [hashtable]$Fields)
+    hidden [string]FormatMessage([string]$Message, [LoggingLevel]$Level, [bool]$Bare, [hashtable]$Fields, [bool]$SkipMasking)
     {
-        $maskedMessage = $this.MaskMessage($Message)
+        $maskedMessage = if ($SkipMasking) { $Message } else { $this.MaskMessage($Message) }
 
         if ($this.OutputFormat -eq 'Json')
         {
@@ -777,7 +806,7 @@ class Logger
             {
                 foreach ($key in $Fields.Keys)
                 {
-                    $record[$key] = $this.MaskFieldValue($key, $Fields[$key])
+                    $record[$key] = if ($SkipMasking) { $Fields[$key] } else { $this.MaskFieldValue($key, $Fields[$key]) }
                 }
             }
 
@@ -798,7 +827,10 @@ class Logger
 
         if ($Fields)
         {
-            $fieldText = ($Fields.Keys | ForEach-Object { "$_=$($this.MaskFieldValue($_, $Fields[$_]))" }) -join ', '
+            $fieldText = ($Fields.Keys | ForEach-Object {
+                    $value = if ($SkipMasking) { $Fields[$_] } else { $this.MaskFieldValue($_, $Fields[$_]) }
+                    "$_=$value"
+                }) -join ', '
             $text = "$text | $fieldText"
         }
 
@@ -1355,6 +1387,12 @@ function New-Logger
     Information is silent by default unless $InformationPreference/-InformationAction says
     otherwise - that's native Write-Information behavior, not a bug.
 
+    .PARAMETER EnableDefaultMasking
+    Apply the same curated masking preset as Add-LoggerDefaultMaskRule (common secret
+    keywords - password, pwd, secret, token, apikey/api_key, connectionstring - as both
+    message-text rules and wildcard-matched -Fields entries) at creation time, instead of
+    calling it separately afterwards.
+
     .EXAMPLE
     $logger = New-Logger -Level Verbose -Destination Both -SetActive
     Write-Log 'Hello world'
@@ -1414,7 +1452,10 @@ function New-Logger
         [string]$TimestampFormat,
 
         [Parameter()]
-        [switch]$UseNativeStreams
+        [switch]$UseNativeStreams,
+
+        [Parameter()]
+        [switch]$EnableDefaultMasking
     )
 
     $callerScript = (Get-PSCallStack)[1].ScriptName
@@ -1472,6 +1513,11 @@ function New-Logger
         if ($UseNativeStreams)
         {
             $logger.SetUseNativeStreams($true)
+        }
+
+        if ($EnableDefaultMasking)
+        {
+            $logger.AddDefaultMaskRules()
         }
 
         if ($SetActive -or (-not $script:ActiveLogger))
@@ -2294,13 +2340,15 @@ function Add-LoggerMaskField
 
     .DESCRIPTION
     Unlike Add-LoggerMaskRule, which pattern-matches free text, this replaces the entire value
-    of any -Fields entry whose key matches -FieldName (case-insensitive) - in both 'Text' and
-    'Json' output. Useful for structured values like `-Fields @{ Password = $plainText }` that
-    a text regex could miss depending on formatting.
+    of any -Fields entry whose key matches -FieldName - in both 'Text' and 'Json' output.
+    Useful for structured values like `-Fields @{ Password = $plainText }` that a text regex
+    could miss depending on formatting.
 
     .PARAMETER FieldName
-    The -Fields key to mask (case-insensitive). Adding a name that's already masked is a
-    no-op.
+    The -Fields key to mask, matched case-insensitively. Supports PowerShell wildcards (e.g.
+    '*token*' matches AccessToken, RefreshToken, ApiTokenValue, ...); a plain name with no
+    wildcard characters matches only that exact key. Adding a pattern that's already present
+    (compared as literal text) is a no-op.
 
     .PARAMETER Logger
     The Logger instance to update. Defaults to the active logger.
@@ -2308,6 +2356,10 @@ function Add-LoggerMaskField
     .EXAMPLE
     Add-LoggerMaskField -FieldName Password
     Write-Log 'login attempt' -Fields @{ Password = $plainText }
+
+    .EXAMPLE
+    Add-LoggerMaskField -FieldName '*token*'
+    Write-Log 'refreshed' -Fields @{ AccessToken = $token }   # AccessToken matches '*token*'
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -2329,7 +2381,11 @@ function Get-LoggerMaskField
 {
     <#
     .SYNOPSIS
-    Lists the -Fields key names being masked on a logger.
+    Lists the -Fields key patterns being masked on a logger.
+
+    .DESCRIPTION
+    Returns the patterns as registered by Add-LoggerMaskField, which may include wildcards
+    (e.g. '*token*') rather than only exact key names.
 
     .PARAMETER Logger
     The Logger instance to query. Defaults to the active logger.
@@ -2351,10 +2407,11 @@ function Remove-LoggerMaskField
 {
     <#
     .SYNOPSIS
-    Stops masking a -Fields key previously added with Add-LoggerMaskField.
+    Stops masking a -Fields key pattern previously added with Add-LoggerMaskField.
 
     .PARAMETER FieldName
-    The field name to stop masking (case-insensitive).
+    The exact pattern to remove, as originally passed to Add-LoggerMaskField (case-insensitive
+    literal match - this does not re-evaluate a wildcard against current field names).
 
     .PARAMETER Logger
     The Logger instance to update. Defaults to the active logger.
@@ -2446,11 +2503,13 @@ function Add-LoggerDefaultMaskRule
     A convenience preset over Add-LoggerMaskRule/Add-LoggerMaskField for the common case of
     "don't let credentials reach the log". Covers 'key=value', 'key: value', and
     '"key": "value"' style text (e.g. 'password=hunter2', '"apiKey": "abc123"') as well as
-    -Fields keys named Password, Pwd, Secret, Token, ApiKey, or ConnectionString.
+    -Fields keys containing password, pwd, secret, token, apikey/api_key, or connectionstring
+    (matched with wildcards, e.g. 'AccessToken' and 'ApiTokenValue' both match 'token').
 
     Review Get-LoggerMaskRule/Get-LoggerMaskField afterwards, and add more with
     Add-LoggerMaskRule/Add-LoggerMaskField for anything specific to your application that this
-    preset doesn't cover.
+    preset doesn't cover. See also New-Logger -EnableDefaultMasking to apply this preset at
+    logger creation time instead of calling it separately.
 
     .PARAMETER Logger
     The Logger instance to update. Defaults to the active logger.
@@ -2465,24 +2524,9 @@ function Add-LoggerDefaultMaskRule
     )
 
     $target = Resolve-TargetLogger -Logger $Logger
-    if (-not $PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), 'Add default mask rules'))
+    if ($PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), 'Add default mask rules'))
     {
-        return
-    }
-
-    $keywords = 'password', 'pwd', 'secret', 'token', 'apikey', 'api_key', 'connectionstring'
-    foreach ($keyword in $keywords)
-    {
-        # Matches key=value / key: value / "key": "value" text. The 'Prefix' group covers the
-        # key, separator, and any opening quote, so only the value itself gets replaced.
-        $pattern = '(?i)(?<Prefix>"?' + $keyword + '"?\s*[:=]\s*"?)[^\s",}]+'
-        $target.AddMaskRule($pattern, $null)
-    }
-
-    $fields = 'Password', 'Pwd', 'Secret', 'Token', 'ApiKey', 'ConnectionString'
-    foreach ($field in $fields)
-    {
-        $target.AddMaskField($field)
+        $target.AddDefaultMaskRules()
     }
 }
 
@@ -2526,6 +2570,11 @@ function Write-Log
     these become additional JSON properties; in 'Text' mode they're appended as 'key=value'
     pairs.
 
+    .PARAMETER SkipMasking
+    Bypass the target logger's mask rules/fields (see Add-LoggerMaskRule/Add-LoggerMaskField)
+    for this call only - useful when debugging a value you deliberately need to see unmasked.
+    The logger's rules/fields are untouched; this only affects the current write.
+
     .PARAMETER Logger
     The Logger instance to write through. Defaults to the active logger.
 
@@ -2568,6 +2617,9 @@ function Write-Log
         [hashtable]$Fields,
 
         [Parameter()]
+        [switch]$SkipMasking,
+
+        [Parameter()]
         [Logger]$Logger
     )
 
@@ -2607,7 +2659,7 @@ function Write-Log
             $target.LogDestination
         }
 
-        $target.Write($effectiveMessage, $levelObj, $destinationObj, $Bare.IsPresent, $Fields)
+        $target.Write($effectiveMessage, $levelObj, $destinationObj, $Bare.IsPresent, $Fields, $SkipMasking.IsPresent)
     }
 }
 

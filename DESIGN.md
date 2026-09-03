@@ -340,5 +340,27 @@ the hood.
 
 `Tests/LogaPe.Tests.ps1`'s `Masking` context covers: a message-text rule preserving its prefix,
 field masking in both `Text` and `Json` output, a custom replacement token, the
-`Add-LoggerDefaultMaskRule` preset, and that `Remove-LoggerMaskRule`/`Remove-LoggerMaskField`
-actually stop masking.
+`Add-LoggerDefaultMaskRule` preset, that `Remove-LoggerMaskRule`/`Remove-LoggerMaskField`
+actually stop masking, and the three follow-up enhancements below.
+
+### Follow-up enhancements
+
+Three gaps identified in review, addressed in the same feature:
+
+- **Wildcard field-name matching.** `Add-LoggerMaskField -FieldName` originally required an
+  exact key match, so `AccessToken`/`RefreshToken`/`ApiToken` each needed their own call.
+  `MaskFieldValue` now matches with `-ilike` instead of `-ieq`; since a plain name with no
+  wildcard characters behaves identically to an exact match under `-ilike`, this is a strict
+  superset of the old behavior with no separate code path needed for the non-wildcard case.
+  `Add-LoggerDefaultMaskRule`'s field list was updated to `'*password*'`, `'*token*'`, etc. to
+  take advantage of this rather than only matching the literal keyword.
+- **`New-Logger -EnableDefaultMasking`.** Applies the same preset as
+  `Add-LoggerDefaultMaskRule` at construction time. The preset logic was factored out of the
+  `Add-LoggerDefaultMaskRule` function into a `Logger.AddDefaultMaskRules()` method so both the
+  function and `New-Logger` call the same implementation rather than duplicating it.
+- **`Write-Log -SkipMasking`.** A per-call bypass for when a caller deliberately needs to see
+  an unmasked value (e.g. while debugging), without touching the logger's registered rules.
+  Threading this through required widening `Logger.Write()`'s master overload from 5 to 6
+  arguments (`$SkipMasking`, defaulted to `$false` by every shorter overload) down through
+  `_WriteOutput` to `FormatMessage`, where it short-circuits both the message-text and
+  `-Fields` masking calls for that one write.
