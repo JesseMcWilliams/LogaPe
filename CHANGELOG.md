@@ -5,6 +5,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 
 ## [Unreleased]
 
+### Added
+- Masking: `Add-LoggerMaskRule`/`Get-LoggerMaskRule`/`Remove-LoggerMaskRule` scrub sensitive
+  values out of message text via a case-insensitive regex (an optional named
+  `(?<Prefix>...)` group preserves a literal prefix like `password=` while masking only the
+  value after it); `Add-LoggerMaskField`/`Get-LoggerMaskField`/`Remove-LoggerMaskField` do the
+  same for `-Fields` keys, replacing the value wholesale regardless of type. Both apply
+  uniformly across Console/File/every sink and Text/Json output, since they run inside
+  `FormatMessage` where all destinations converge. `Get-LoggerMaskReplacement`/
+  `Set-LoggerMaskReplacement` control the substituted text (default `'***'`).
+  `Add-LoggerDefaultMaskRule` adds a ready-made preset covering common secret keywords
+  (password, pwd, secret, token, apikey/api_key, connectionstring) as both text patterns and
+  masked fields. See [USAGE.md](USAGE.md#masking-sensitive-values) and
+  [DESIGN.md](DESIGN.md#11-masking-v050) for details.
+- `USAGE.md`: a dedicated usage guide with a full walkthrough of every feature and the
+  function reference, split out of `README.md` to keep the README a short overview.
+
 ## [0.4.0] - 2026-08-28
 
 ### Added
