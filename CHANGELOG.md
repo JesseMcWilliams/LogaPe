@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-25
+
 ### Added
 - Masking: `Add-LoggerMaskRule`/`Get-LoggerMaskRule`/`Remove-LoggerMaskRule` scrub sensitive
   values out of message text via a case-insensitive regex (an optional named
