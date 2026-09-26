@@ -20,9 +20,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
   exact keyword matches - `Add-LoggerMaskField -FieldName` now supports wildcards generally,
   e.g. `'*token*'`). `New-Logger -EnableDefaultMasking` applies the same preset at creation
   time. `Write-Log -SkipMasking` bypasses masking for one call, without altering the logger's
-  registered rules/fields. See [USAGE.md](USAGE.md#masking-sensitive-values) and
-  [DESIGN.md](DESIGN.md#11-masking-v050) for details.
-- `USAGE.md`: a dedicated usage guide with a full walkthrough of every feature and the
+  registered rules/fields. See [User_Docs/Usage.md](User_Docs/Usage.md#masking-sensitive-values) and
+  [Claude_Docs/Design_Architecture.md](Claude_Docs/Design_Architecture.md#11-masking-v050) for details.
+- `User_Docs/Usage.md`: a dedicated usage guide with a full walkthrough of every feature and the
   function reference, split out of `README.md` to keep the README a short overview.
 
 ## [0.4.0] - 2026-08-28
@@ -168,7 +168,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 - Rewrote `WriteConsole`'s level-to-color dispatch as an `if`/`elseif` chain instead of a
   `switch` with `break`. A `break` inside a `switch` statement inside a PowerShell class
   method can escape as an unhandled exception rather than just exiting the switch - a real
-  PowerShell/class interaction quirk found while adding test coverage (see DESIGN.md §10).
+  PowerShell/class interaction quirk found while adding test coverage (see Claude_Docs/Design_Architecture.md §10).
 - Fixed `PSAvoidUsingEmptyCatchBlock` on `WriteFile`'s retry loop by logging the swallowed
   exception via `Write-Debug` instead of silently discarding it.
 
@@ -176,4 +176,4 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 - Classes and functions that use them as parameter types must live in the same file - a
   dot-sourced `Public`/`Private` folder split (as originally planned) fails with
   `Unable to find type [Logger]`, since PowerShell resolves a class type literal by parsing
-  the *same file*, not the whole loaded module. See DESIGN.md §10 for details.
+  the *same file*, not the whole loaded module. See Claude_Docs/Design_Architecture.md §10 for details.

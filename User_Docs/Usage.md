@@ -1,8 +1,8 @@
 # LogaPe — Usage Guide
 
 A complete walkthrough of LogaPe's features. For a quick overview and install steps, see
-[README.md](README.md); for why it's built this way, see [DESIGN.md](DESIGN.md); for runnable
-versions of most of what's below, see [Examples/](Examples/).
+[README.md](../README.md); for why it's built this way, see [Claude_Docs/Design_Architecture.md](../Claude_Docs/Design_Architecture.md); for runnable
+versions of most of what's below, see [Examples/](../Examples/).
 
 ## Contents
 
