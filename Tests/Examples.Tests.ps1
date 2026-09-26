@@ -19,7 +19,7 @@ Describe 'Examples' {
     # failing the first time it was written) that is NOT the same script scope as the Discovery
     # pass above, so $script:-scoping the variable above did not make it visible here either.
     # Recomputing it inside BeforeAll (which itself runs during Run phase) is what actually
-    # works - see LESSONS-LEARNED.md's Discovery-vs-Run entry.
+    # works - see Claude_Docs/Reference_Lessons-Learned.md's Discovery-vs-Run entry.
     BeforeAll {
         $script:exampleScriptsAtRunTime = Get-ChildItem -Path (Join-Path $PSScriptRoot '..\Examples') -Filter '*.ps1'
     }

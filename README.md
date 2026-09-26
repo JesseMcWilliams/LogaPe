@@ -49,13 +49,13 @@ Write-Log 'Unhandled exception in worker thread' -Level Error
 
 ## Documentation
 
-- **[USAGE.md](USAGE.md)** — the full usage guide: every feature (multiple loggers, levels,
+- **[User_Docs/Usage.md](User_Docs/Usage.md)** — the full usage guide: every feature (multiple loggers, levels,
   rotation, JSON output, exceptions, native streams, tailing, sinks, masking) with examples,
   plus the complete function reference.
-- **[Examples/](Examples/)** — runnable scripts covering the same ground as USAGE.md.
-- **[DESIGN.md](DESIGN.md)** — the module's architecture, the bugs found and fixed during its
+- **[Examples/](Examples/)** — runnable scripts covering the same ground as User_Docs/Usage.md.
+- **[Claude_Docs/Design_Architecture.md](Claude_Docs/Design_Architecture.md)** — the module's architecture, the bugs found and fixed during its
   rewrite, and the reasoning behind its API shape (including masking's design, §11).
-- **[LESSONS-LEARNED.md](LESSONS-LEARNED.md)** — recurring bugs and failure points hit along
+- **[Claude_Docs/Reference_Lessons-Learned.md](Claude_Docs/Reference_Lessons-Learned.md)** — recurring bugs and failure points hit along
   the way; check it before debugging something that feels like it should already work.
 - **[CHANGELOG.md](CHANGELOG.md)** — release history.
 
