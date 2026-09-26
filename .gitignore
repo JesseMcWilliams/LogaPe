@@ -1,2 +1,12 @@
 *.log
 testResults.xml
+
+# Added by aPeTemplate\New-ApeProject.ps1
+*.local.md
+*.csv
+*.cred
+*.clixml
+Secrets/
+.vscode/
+Thumbs.db
+desktop.ini
