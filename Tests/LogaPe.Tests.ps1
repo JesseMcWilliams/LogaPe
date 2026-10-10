@@ -60,6 +60,31 @@ Describe 'LogaPe' {
         }
     }
 
+    Context 'Mutex naming' {
+        It 'names the mutex with a SHA256 hash of the lower-cased full path' {
+            InModuleScope LogaPe {
+                $path = 'C:\Temp\LogaPe-Mutex\App.log'
+                $sha256 = New-Object System.Security.Cryptography.SHA256CryptoServiceProvider
+                $expectedHash = -join ($sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($path.ToLowerInvariant())) | ForEach-Object { $_.ToString('x2') })
+                $sha256.Dispose()
+
+                ConvertTo-LogMutexName -Path $path | Should -Be "LogaPe_$expectedHash"
+            }
+        }
+
+        It 'resolves the same name regardless of path casing' {
+            InModuleScope LogaPe {
+                ConvertTo-LogMutexName -Path 'C:\Temp\LogaPe-Mutex\App.log' | Should -Be (ConvertTo-LogMutexName -Path 'c:\temp\logape-mutex\APP.LOG')
+            }
+        }
+
+        It 'resolves different names for the same file name in different folders' {
+            InModuleScope LogaPe {
+                ConvertTo-LogMutexName -Path 'C:\Temp\A\app.log' | Should -Not -Be (ConvertTo-LogMutexName -Path 'C:\Temp\B\app.log')
+            }
+        }
+    }
+
     Context 'Active logger fallback' {
         It 'throws a clear error when no active logger has been set and none is passed' {
             { Write-Log 'no logger' } | Should -Throw '*No active logger*'

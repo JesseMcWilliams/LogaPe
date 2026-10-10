@@ -5,6 +5,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 
 ## [Unreleased]
 
+### Fixed
+- Loggers can now be created on hosts that enforce FIPS mode. The per-file mutex name was
+  derived with MD5, which .NET Framework (Windows PowerShell 5.1) refuses to construct under FIPS
+  policy, so every `New-Logger` failed there. It now uses the FIPS-validated
+  `SHA256CryptoServiceProvider`. Because the mutex name changes (`LogaPe_<64 hex chars>`), a
+  process running this version and one running 0.5.0 or older won't serialize writes to the
+  same log file; upgrade every writer of a shared log together.
+
 ## [0.5.0] - 2026-09-25
 
 ### Added
