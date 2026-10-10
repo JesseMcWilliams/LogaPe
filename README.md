@@ -5,7 +5,7 @@ and additional sinks (e.g. Windows Event Log), with configurable levels, rotatio
 (JSON) output, and masking of sensitive values. Concurrent writers to the same file are
 serialized with a named mutex so lines don't interleave or get lost.
 
-Targets Windows PowerShell 5.1.
+Runs on Windows PowerShell 5.1 and PowerShell 7 (Windows), tested on 7.6.
 
 ## Features
 

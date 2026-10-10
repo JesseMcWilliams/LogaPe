@@ -6,6 +6,7 @@
     Copyright         = '(c) Jesse McWilliams. Licensed under the MIT License.'
     Description       = 'Thread- and process-safe logging to the console, a file, and additional sinks (e.g. Windows Event Log), with configurable levels, rotation, output format, and tailing.'
     PowerShellVersion = '5.1'
+    CompatiblePSEditions = @('Desktop', 'Core')
 
     FunctionsToExport = @(
         'New-Logger'

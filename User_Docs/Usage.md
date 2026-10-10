@@ -145,7 +145,8 @@ Remove-LoggerSink -Id $sinkId
 ```
 
 If `-Source` isn't already a registered event source, `Add-LoggerEventLogSink` tries to
-register it via `New-EventLog`, which needs local administrator rights. Without them, it warns
+register it via `[System.Diagnostics.EventLog]::CreateEventSource` (not `New-EventLog`, which
+PowerShell 7 doesn't have), which needs local administrator rights. Without them, it warns
 and explains how to pre-register the source manually — the sink is still added, and later
 writes fail individually (with their own warning) rather than throwing. `Get-LoggerSink` lists
 every sink registered on a logger.

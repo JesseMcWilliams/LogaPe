@@ -3,13 +3,14 @@
 LogaPe is a thread- and process-safe (mutex-guarded) PowerShell logging
 module for console/file/Event-Log output, with configurable levels,
 rotation, JSON output, and field/value masking of sensitive data. Runtime
-target is Windows PowerShell 5.1 only (`PowerShellVersion = '5.1'` in
-`LogaPe/LogaPe.psd1`); no `Set-StrictMode` or `#Requires` is used anywhere
+targets are Windows PowerShell 5.1 and PowerShell 7 on Windows (`PowerShellVersion = '5.1'`,
+`CompatiblePSEditions = Desktop, Core` in `LogaPe/LogaPe.psd1`); every change must work on both.
+No `Set-StrictMode` or `#Requires` is used anywhere
 in the module, tests, or examples, so strict mode is not enabled.
 
 ## Folder map
 - `LogaPe/` — the module: `LogaPe.psd1` (manifest) and `LogaPe.psm1` (all code — classes, private helpers, public functions in one 2706-line file by design, see Claude_Docs/Design_Architecture.md §10). Over 1,000 lines: grep for the function/class name and read a line range; don't read the whole file.
-- `Tests/` — Pester tests: `LogaPe.Tests.ps1` (492 lines) and `Examples.Tests.ps1` (39 lines, smoke-tests each `Examples/*.ps1` script as its own PS 5.1 subprocess).
+- `Tests/` — Pester tests: `LogaPe.Tests.ps1` (492 lines) and `Examples.Tests.ps1` (49 lines, smoke-tests each `Examples/*.ps1` script as its own PS 5.1 subprocess, and as a PS 7 subprocess when one is found).
 - `Examples/` — runnable, smoke-tested usage scripts (`01-GettingStarted.ps1` … `07-EventLogSink.ps1`) plus a `README.md` index.
 - `Claude_Docs/Design_Architecture.md` — design doc; §1-9 the original module rewrite, §10 what actually shipped, §11 the masking feature (v0.5.0).
 - `CHANGELOG.md` — version history, `[Unreleased]` at top. Kept at repo root (not in `Claude_Docs/`) — standard tooling/GitHub convention for finding a changelog.
@@ -22,7 +23,8 @@ in the module, tests, or examples, so strict mode is not enabled.
 ## Tests
 - Run all: `Invoke-Pester -Path .\Tests`
 - Run one file: `Invoke-Pester -Path .\Tests\LogaPe.Tests.ps1` (or `.\Tests\Examples.Tests.ps1`)
-- PS 5.1 check: `Tests\Examples.Tests.ps1` runs each `Examples/*.ps1` script as its own Windows PowerShell 5.1 subprocess — running that file IS the PS 5.1 check.
+- Edition check: `Tests\Examples.Tests.ps1` runs each `Examples/*.ps1` script as its own Windows PowerShell 5.1 subprocess, and also under PowerShell 7 when `$env:LOGAPE_PWSH` (full path to `pwsh.exe`) is set or `pwsh` is on PATH. If neither is available, say the PS 7 check was skipped.
+- PS 7 module tests: also run `LogaPe.Tests.ps1` itself under `pwsh` (with Pester 5+ importable there) before committing a change that touches the module.
 - Redirect test output to a file and read only the summary or failures. Don't stream full test output into the conversation.
 - The suite must stay at 100% pass. Run the single test file while iterating and the full suite before you commit.
 
