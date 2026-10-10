@@ -919,6 +919,10 @@ function ConvertTo-LogMutexName
     to share a file name in different folders. Hashing the full, normalized path avoids that
     while still resolving to the same name for the same file across processes.
 
+    Uses SHA256CryptoServiceProvider, not MD5 or SHA256.Create(): on .NET Framework (Windows
+    PowerShell 5.1) both MD5 and SHA256.Create()'s default SHA256Managed are non-FIPS-validated
+    and throw when the host enforces FIPS mode, which would break every logger at creation.
+
     .PARAMETER Path
     The log file path (need not exist yet).
 
@@ -933,14 +937,14 @@ function ConvertTo-LogMutexName
     )
 
     $fullPath = [System.IO.Path]::GetFullPath($Path).ToLowerInvariant()
-    $md5 = [System.Security.Cryptography.MD5]::Create()
+    $sha256 = New-Object System.Security.Cryptography.SHA256CryptoServiceProvider
     try
     {
-        $hashBytes = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($fullPath))
+        $hashBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($fullPath))
     }
     finally
     {
-        $md5.Dispose()
+        $sha256.Dispose()
     }
 
     $hash = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })

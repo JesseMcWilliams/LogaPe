@@ -190,3 +190,14 @@ synchronize on each other's mutex. Fixed by hashing the full, normalized path. *
 name a system-wide object after user-supplied data, ask what happens when two unrelated
 callers pick the same short name - and prefer deriving the name from something that's actually
 unique to the resource (a full path, a GUID), not something merely convenient.**
+
+### Any hash, even a non-security one, must be FIPS-validated on Windows PowerShell 5.1
+
+That path hash used `[System.Security.Cryptography.MD5]::Create()`. On .NET Framework, a host
+that enforces FIPS mode (`FipsAlgorithmPolicy` = 1, common on locked-down servers) throws when a
+non-validated algorithm class is constructed, whatever the hash is used for. So every
+`New-Logger` would have failed on such a host. `[SHA256]::Create()` is **not** a fix: on .NET
+Framework it returns `SHA256Managed`, which is also non-validated. Fixed with
+`SHA256CryptoServiceProvider`, the validated implementation. **On 5.1, use the
+`*CryptoServiceProvider` (or `*Cng`) classes for any hashing, and never MD5 or the `*Managed`
+classes, even for naming or checksums.**
