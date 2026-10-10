@@ -33,7 +33,7 @@ These came out of the initial review discussion:
 | Decision | Choice |
 |---|---|
 | Module name | **`LogaPe`** (renamed from generic "Logger", see §6) |
-| PowerShell target | **Windows PowerShell 5.1 only** (matches current README; no cross-platform requirement) |
+| PowerShell target | Originally **Windows PowerShell 5.1 only**. Since 2026-10-09: **5.1 and PowerShell 7 on Windows** (`CompatiblePSEditions = Desktop, Core`), because aPeDiscovery moved to PowerShell 7. Event Log access uses `[System.Diagnostics.EventLog]` directly, since PowerShell 7 has no `*-EventLog` cmdlets. |
 | Public API shape | **Add approved-verb function wrappers** (`New-Logger`, `Write-Log`, etc.) as the primary, exported, documented API; keep the classes underneath |
 | Default/active logger | **Supported** — `Write-Log` works without an explicit `-Logger` argument (see §7) |
 | Publish to Gallery now? | **Not yet** — build to Gallery quality, wire up real publishing later |

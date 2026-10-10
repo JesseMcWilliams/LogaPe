@@ -890,10 +890,12 @@ class Logger
                 'Information'
             }
 
+            # [System.Diagnostics.EventLog] rather than Write-EventLog: PowerShell 7 removed the
+            # *-EventLog cmdlets, and the .NET class behaves the same on 5.1 and 7.
             try
             {
-                Write-EventLog -LogName $Sink.Config.LogName -Source $Sink.Config.Source `
-                    -EventId $Sink.Config.EventId -EntryType $entryType -Message $FormattedMessage -ErrorAction Stop
+                [System.Diagnostics.EventLog]::WriteEntry($Sink.Config.Source, $FormattedMessage,
+                    [System.Diagnostics.EventLogEntryType]$entryType, [int]$Sink.Config.EventId)
             }
             catch
             {
@@ -2077,7 +2079,7 @@ function Add-LoggerEventLogSink
     capturing everything at Verbose. A logger can have any number of sinks.
 
     If -Source isn't already a registered event source, this attempts to register it via
-    New-EventLog, which requires local administrator rights. On failure, it emits a warning
+    [System.Diagnostics.EventLog]::CreateEventSource, which requires local administrator rights. On failure, it emits a warning
     explaining how to pre-register the source manually and still adds the sink - later writes
     will retry and fail individually (with their own warning) rather than the registration
     failure blocking your script.
@@ -2135,7 +2137,8 @@ function Add-LoggerEventLogSink
     {
         if (-not [System.Diagnostics.EventLog]::SourceExists($Source))
         {
-            New-EventLog -LogName $LogName -Source $Source -ErrorAction Stop
+            # Not New-EventLog: PowerShell 7 removed the *-EventLog cmdlets.
+            [System.Diagnostics.EventLog]::CreateEventSource($Source, $LogName)
         }
     }
     catch
@@ -2144,8 +2147,8 @@ function Add-LoggerEventLogSink
         # before formatting - otherwise it silently only formats the last concatenated fragment.
         $template = "Could not register event source '{0}' automatically (requires local " +
             "administrator rights): {1}. Pre-register it manually as Administrator: " +
-            "New-EventLog -LogName '{2}' -Source '{0}'. The sink is still added; writes will " +
-            'fail individually (with their own warning) until the source exists.'
+            "[System.Diagnostics.EventLog]::CreateEventSource('{0}', '{2}'). The sink is still " +
+            'added; writes will fail individually (with their own warning) until the source exists.'
         Write-Warning ($template -f $Source, $_.Exception.Message, $LogName)
     }
 

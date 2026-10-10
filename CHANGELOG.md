@@ -5,7 +5,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 
 ## [Unreleased]
 
+### Added
+- PowerShell 7 (Windows) support, declared with `CompatiblePSEditions = Desktop, Core`. The
+  module tests and every example pass on 7.6.6. `Tests\Examples.Tests.ps1` also runs each example
+  under PowerShell 7 when `$env:LOGAPE_PWSH` is set or `pwsh` is on PATH.
+
 ### Fixed
+- The Windows Event Log sink works on PowerShell 7. It used `New-EventLog`/`Write-EventLog`,
+  which PowerShell 7 removed; it now calls `[System.Diagnostics.EventLog]` directly, which
+  behaves the same on 5.1.
 - Loggers can now be created on hosts that enforce FIPS mode. The per-file mutex name was
   derived with MD5, which .NET Framework (Windows PowerShell 5.1) refuses to construct under FIPS
   policy, so every `New-Logger` failed there. It now uses the FIPS-validated

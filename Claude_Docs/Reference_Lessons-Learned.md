@@ -69,6 +69,16 @@ scope is no longer reachable under that name.
 any scriptblock using `$_`), capture the outer value into a named variable (`$line = $_`)
 *before* the `try`, and use that name everywhere inside, including inside `catch`.
 
+### PowerShell 7 removed some Windows PowerShell cmdlets outright - prefer the .NET class they wrapped
+
+The Event Log sink called `New-EventLog`/`Write-EventLog`. Neither exists in PowerShell 7 (the
+whole `*-EventLog` family was dropped), so the sink would fail there with "not recognized",
+and the test suite didn't notice because its event-log tests deliberately don't assert that a
+write succeeded, and the example smoke tests only ran under 5.1. Fixed by calling
+`[System.Diagnostics.EventLog]::CreateEventSource`/`::WriteEntry`, which exist on both. **When
+code must run on 5.1 and 7, check each cmdlet against PowerShell 7's removed list (also
+`Get-WmiObject`, `*-Transaction`, the PSSnapin cmdlets), and test examples under both editions.**
+
 ### `[powershell]::BeginInvoke()`'s generic overloads need every argument strongly typed
 
 **Symptom:** `MethodException: Cannot find an overload for "BeginInvoke" and the argument
