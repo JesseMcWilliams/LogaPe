@@ -5,6 +5,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-11
+
+### Upgrade note
+- **Upgrade every process that writes a shared log file together.** The per-file mutex name
+  changed (see Fixed below), so a writer on 0.5.0 or older and a writer on 0.6.0 use different
+  mutexes and won't serialize writes to the same file.
+
 ### Added
 - PowerShell 7 (Windows) support, declared with `CompatiblePSEditions = Desktop, Core`. The
   module tests and every example pass on 7.6.6. `Tests\Examples.Tests.ps1` also runs each example
