@@ -5,6 +5,30 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 
 ## [Unreleased]
 
+### Added
+- Syslog sink: `Add-LoggerSyslogSink` sends messages to a syslog collector over UDP (RFC 5426),
+  TCP (RFC 6587, octet-counting or LF framing) or TLS (RFC 5425). Messages are RFC 5424 by
+  default, or RFC 3164 for older collectors. The body is the masked message and fields, in the
+  logger's Text or Json layout; `-StructuredDataId` sends the fields as RFC 5424 structured data
+  instead. Options include facility, app name, host name, MSGID and a maximum size (with
+  truncation at a character boundary). It has its own minimum level, like the Event Log sink.
+- Syslog over TLS follows current practice (RFC 9662): TLS 1.2 and 1.3 only, server
+  certificate chain and name validation by default, optional revocation checking
+  (`-CheckCertificateRevocation`), SHA-256 certificate pinning
+  (`-ServerCertificateThumbprint`), and mutual TLS (`-ClientCertificate`).
+  `-SkipCertificateCheck` is available for labs and warns.
+- A syslog collector that's down never throws into your script and never stalls every write:
+  the sink warns once, backs off (1 s doubling to 60 s) while dropping messages, and warns again
+  with the dropped count when the collector is back. `Remove-LoggerSink` and `Remove-Logger`
+  close the connection.
+- `Examples/08-SyslogSink.ps1`.
+
+### Fixed
+- Sink warnings (for example a failed Event Log write) now honor `Write-Log`'s
+  `-WarningAction` and `-WarningVariable` and `$WarningPreference`. They were written from
+  inside a class method, which bypasses all three, so `-WarningAction SilentlyContinue` didn't
+  silence them.
+
 ## [0.6.0] - 2026-10-11
 
 ### Upgrade note

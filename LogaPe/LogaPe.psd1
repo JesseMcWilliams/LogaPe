@@ -12,6 +12,7 @@
         'New-Logger'
         'Remove-Logger'
         'Add-LoggerEventLogSink'
+        'Add-LoggerSyslogSink'
         'Get-LoggerSink'
         'Remove-LoggerSink'
         'Write-Log'

@@ -80,12 +80,28 @@ class LoggingSink
     [LoggingLevel] $Level
     [hashtable] $Config
 
+    # Live resources a sink holds (e.g. a SyslogTransport's socket). Kept out of Config so
+    # Get-LoggerSink only ever shows plain settings.
+    hidden [object] $Transport
+
+    # A sink's message builder, if it has one (SyslogFormatter).
+    hidden [object] $Formatter
+
     LoggingSink([string]$Type, [LoggingLevel]$Level, [hashtable]$Config)
     {
         $this.Id = [guid]::NewGuid().ToString()
         $this.Type = $Type
         $this.Level = $Level
         $this.Config = $Config
+    }
+
+    [void]Dispose()
+    {
+        if ($null -ne $this.Transport)
+        {
+            $this.Transport.Dispose()
+            $this.Transport = $null
+        }
     }
 }
 
@@ -106,6 +122,615 @@ class MaskRule
         $this.Pattern = $Pattern
         $this.Replacement = $Replacement
         $this.Regex = [regex]::new($Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
+}
+
+# Builds syslog messages: RFC 5424 (default) or RFC 3164 (legacy BSD). No I/O, so the tests
+# can check the exact bytes without a network. Framing for TCP is the transport's job; this
+# returns one bare message.
+#
+# Instance methods only, here and in SyslogTransport: a static method of a PowerShell class is
+# bound to the last runspace that imported the module, and throws NullReferenceException once
+# that runspace is gone (e.g. after a runspace-based concurrent writer finishes).
+class SyslogFormatter
+{
+    hidden [hashtable] $Facilities = @{
+        kern = 0; user = 1; mail = 2; daemon = 3; auth = 4; syslog = 5; lpr = 6; news = 7
+        uucp = 8; cron = 9; authpriv = 10; ftp = 11; ntp = 12; audit = 13; alert = 14; clock = 15
+        local0 = 16; local1 = 17; local2 = 18; local3 = 19; local4 = 20; local5 = 21; local6 = 22; local7 = 23
+    }
+
+    [string] $TruncationMarker = '...[truncated]'
+
+    [int] $ProcessId = [System.Diagnostics.Process]::GetCurrentProcess().Id
+
+    # LogaPe has nothing for emerg (0), alert (1) or notice (5). 'None' used as a message level
+    # is sent as info.
+    [int]Severity([string]$LevelName)
+    {
+        if ($LevelName -eq 'Critical') { return 2 }
+        if ($LevelName -eq 'Error') { return 3 }
+        if ($LevelName -eq 'Warning') { return 4 }
+        if ($LevelName -eq 'Debug' -or $LevelName -eq 'Verbose' -or $LevelName -eq 'Trace') { return 7 }
+        return 6
+    }
+
+    # RFC 5424 header fields are printable US-ASCII with no spaces; anything else is removed,
+    # not escaped. Empty becomes the nil value '-'.
+    [string]HeaderField([string]$Value, [int]$MaxLength)
+    {
+        $clean = [regex]::Replace([string]$Value, '[^\x21-\x7E]', '')
+        if ($clean.Length -gt $MaxLength)
+        {
+            $clean = $clean.Substring(0, $MaxLength)
+        }
+        if (-not $clean)
+        {
+            return '-'
+        }
+        return $clean
+    }
+
+    # The MSG part: the masked message plus, when they aren't sent as structured data, the
+    # fields - in the logger's own Text or Json layout, minus its timestamp and level (the
+    # syslog header carries both).
+    [string]Body([string]$Message, [System.Collections.Specialized.OrderedDictionary]$Fields, [string]$OutputFormat, [bool]$FieldsInBody)
+    {
+        $hasFields = $FieldsInBody -and $null -ne $Fields -and $Fields.Count -gt 0
+
+        if ($OutputFormat -eq 'Json')
+        {
+            $record = [ordered]@{ Message = $Message }
+            if ($hasFields)
+            {
+                foreach ($key in $Fields.Keys)
+                {
+                    $record[$key] = $Fields[$key]
+                }
+            }
+            return ($record | ConvertTo-Json -Compress)
+        }
+
+        if ($hasFields)
+        {
+            return ('{0} | {1}' -f $Message, (ConvertTo-LogFieldText -Fields $Fields))
+        }
+        return $Message
+    }
+
+    # RFC 5424 section 6.3: [SD-ID name="value" ...]. PARAM-NAMEs lose characters the RFC forbids
+    # (=, space, ], ", non-ASCII) and are cut to 32; values escape ", \ and ].
+    [string]StructuredData([string]$SdId, [System.Collections.Specialized.OrderedDictionary]$Fields)
+    {
+        if (-not $SdId -or $null -eq $Fields -or $Fields.Count -eq 0)
+        {
+            return '-'
+        }
+
+        $sb = [System.Text.StringBuilder]::new()
+        [void]$sb.Append('[').Append($SdId)
+        foreach ($key in $Fields.Keys)
+        {
+            $name = [regex]::Replace([string]$key, '[^\x21-\x7E]|[=\]"]', '')
+            if ($name.Length -gt 32)
+            {
+                $name = $name.Substring(0, 32)
+            }
+            if ($name)
+            {
+                $value = ([string]$Fields[$key]).Replace('\', '\\').Replace('"', '\"').Replace(']', '\]')
+                [void]$sb.Append(' ').Append($name).Append('="').Append($value).Append('"')
+            }
+        }
+        [void]$sb.Append(']')
+        return $sb.ToString()
+    }
+
+    # Entry point used by Logger.WriteToSink. $Config is the sink's Config hashtable.
+    [byte[]]Format([hashtable]$Config, [LoggingLevel]$Level, [hashtable]$Masked, [string]$OutputFormat, [DateTimeOffset]$Time)
+    {
+        $pri = ($this.Facilities[$Config.Facility] * 8) + $this.Severity($Level.Name())
+        $useSd = [bool]$Config.StructuredDataId
+        $body = $this.Body($Masked.Message, $Masked.Fields, $OutputFormat, -not $useSd)
+        $sd = if ($useSd) { $this.StructuredData($Config.StructuredDataId, $Masked.Fields) } else { '-' }
+
+        # With LF framing a newline would end the frame early, so CR/LF become spaces.
+        # Octet-counting (the default) carries multi-line messages intact.
+        if ($Config.Framing -eq 'LineFeed')
+        {
+            $body = [regex]::Replace($body, '\r\n|\r|\n', ' ')
+            $sd = [regex]::Replace($sd, '\r\n|\r|\n', ' ')
+        }
+
+        if ($Config.Format -eq 'Rfc3164')
+        {
+            return $this.Format3164($pri, $Time, $Config.HostName, $Config.AppName, $body, [Math]::Min([int]$Config.MaxMessageBytes, 1024))
+        }
+        return $this.Format5424($pri, $Time, $Config.HostName, $Config.AppName, $Config.MessageId, $sd, $body, [int]$Config.MaxMessageBytes)
+    }
+
+    # <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA [MSG]
+    [byte[]]Format5424([int]$Pri, [DateTimeOffset]$Time, [string]$HostName, [string]$AppName, [string]$MessageId, [string]$StructuredData, [string]$Body, [int]$MaxBytes)
+    {
+        $header = '<{0}>1 {1} {2} {3} {4} {5}' -f $Pri,
+            $Time.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffffzzz", [cultureinfo]::InvariantCulture),
+            $this.HeaderField($HostName, 255),
+            $this.HeaderField($AppName, 48),
+            $this.ProcessId,
+            $this.HeaderField($MessageId, 32)
+
+        $prefix = '{0} {1}' -f $header, $StructuredData
+        $result = $this.Assemble($prefix, $Body, $MaxBytes, $true)
+
+        # Structured data too large to leave any room for the message: drop it (say so in the
+        # message) rather than send a cut-off, unparseable SD element.
+        if ($null -eq $result -and $StructuredData -ne '-')
+        {
+            $prefix = '{0} -' -f $header
+            $result = $this.Assemble($prefix, ('[structured data dropped: too large] ' + $Body), $MaxBytes, $true)
+        }
+        if ($null -eq $result)
+        {
+            $result = [System.Text.Encoding]::ASCII.GetBytes($header)
+        }
+        return $result
+    }
+
+    # <PRI>Mmm dd HH:mm:ss HOSTNAME TAG[PID]: MSG - local time, English month, space-padded
+    # day, short host name (RFC 3164 section 4.1.2 forbids the domain), TAG of at most 32 characters.
+    [byte[]]Format3164([int]$Pri, [DateTimeOffset]$Time, [string]$HostName, [string]$AppName, [string]$Body, [int]$MaxBytes)
+    {
+        $local = $Time.ToLocalTime()
+        $stamp = '{0} {1} {2}' -f $local.ToString('MMM', [cultureinfo]::InvariantCulture),
+            $local.Day.ToString([cultureinfo]::InvariantCulture).PadLeft(2, ' '),
+            $local.ToString('HH:mm:ss', [cultureinfo]::InvariantCulture)
+
+        $shortHost = [string]$HostName
+        $ip = $null
+        if (-not [System.Net.IPAddress]::TryParse($shortHost, [ref]$ip))
+        {
+            $shortHost = $shortHost.Split('.')[0]
+        }
+        $shortHost = $this.HeaderField($shortHost, 255)
+
+        $tag = [regex]::Replace([string]$AppName, '[^A-Za-z0-9_.\-]', '')
+        if ($tag.Length -gt 32)
+        {
+            $tag = $tag.Substring(0, 32)
+        }
+        if (-not $tag)
+        {
+            $tag = 'LogaPe'
+        }
+
+        $prefix = '<{0}>{1} {2} {3}[{4}]:' -f $Pri, $stamp, $shortHost, $tag, $this.ProcessId
+        $result = $this.Assemble($prefix, $Body, $MaxBytes, $false)
+        if ($null -eq $result)
+        {
+            $result = [System.Text.Encoding]::ASCII.GetBytes($prefix)
+        }
+        return $result
+    }
+
+    # prefix + SP + body, cut to $MaxBytes. The body is UTF-8; for RFC 5424 a non-ASCII body
+    # starts with a BOM (section 6.4). An oversized body is cut at a UTF-8 character boundary and
+    # ends with the truncation marker. Returns $null if the prefix alone leaves no room.
+    hidden [byte[]]Assemble([string]$Prefix, [string]$Body, [int]$MaxBytes, [bool]$AllowBom)
+    {
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        $prefixBytes = $utf8.GetBytes($Prefix)
+
+        if (-not $Body)
+        {
+            if ($prefixBytes.Length -gt $MaxBytes)
+            {
+                return $null
+            }
+            return $prefixBytes
+        }
+
+        $bom = [byte[]]@()
+        if ($AllowBom -and [regex]::IsMatch($Body, '[^\x00-\x7F]'))
+        {
+            $bom = [byte[]]@(0xEF, 0xBB, 0xBF)
+        }
+        $bodyBytes = $utf8.GetBytes($Body)
+
+        $fixedLength = $prefixBytes.Length + 1 + $bom.Length
+        if ($fixedLength + $bodyBytes.Length -gt $MaxBytes)
+        {
+            $marker = $utf8.GetBytes($this.TruncationMarker)
+            $keep = $MaxBytes - $fixedLength - $marker.Length
+            if ($keep -lt 0)
+            {
+                return $null
+            }
+            # Back up past UTF-8 continuation bytes (10xxxxxx) so no character is split.
+            while ($keep -gt 0 -and ($bodyBytes[$keep] -band 0xC0) -eq 0x80)
+            {
+                $keep--
+            }
+            $cut = [byte[]]::new($keep + $marker.Length)
+            [Array]::Copy($bodyBytes, 0, $cut, 0, $keep)
+            [Array]::Copy($marker, 0, $cut, $keep, $marker.Length)
+            $bodyBytes = $cut
+        }
+
+        $stream = [System.IO.MemoryStream]::new()
+        $stream.Write($prefixBytes, 0, $prefixBytes.Length)
+        $stream.WriteByte(0x20)
+        $stream.Write($bom, 0, $bom.Length)
+        $stream.Write($bodyBytes, 0, $bodyBytes.Length)
+        return $stream.ToArray()
+    }
+}
+
+# Owns a syslog sink's socket: UDP (RFC 5426), TCP (RFC 6587) or TLS (RFC 5425). Opens lazily
+# on the first send, keeps the connection, reconnects after a failure, and backs off (1 s
+# doubling to 60 s) while the collector is unreachable so an outage costs one timeout, not
+# one per message. Send() never throws. It returns a warning text once per outage and once
+# on recovery ($null otherwise), which Write-Log emits in the caller's context.
+class SyslogTransport
+{
+    [string] $Server
+    [int] $Port
+    [string] $Protocol
+    [string] $Framing
+    [int] $TimeoutMs
+    [string] $LastError
+
+    hidden [System.Security.Cryptography.X509Certificates.X509Certificate2] $ClientCertificate
+    hidden [string[]] $PinnedFingerprints = @()
+    hidden [bool] $CheckRevocation = $false
+    hidden [bool] $SkipCertificateCheck = $false
+
+    hidden [object] $SyncRoot = [object]::new()
+    hidden [System.Net.Sockets.UdpClient] $Udp
+    hidden [System.Net.IPEndPoint] $UdpEndPoint
+    hidden [System.Net.Sockets.TcpClient] $Tcp
+    hidden [System.IO.Stream] $Stream
+    hidden [datetime] $RetryAfterUtc = [datetime]::MinValue
+    hidden [int] $BackoffSeconds = 0
+    hidden [bool] $InOutage = $false
+    hidden [long] $Dropped = 0
+
+    SyslogTransport([string]$Server, [int]$Port, [string]$Protocol, [string]$Framing, [int]$TimeoutSeconds)
+    {
+        $this.Server = $Server
+        $this.Port = $Port
+        $this.Protocol = $Protocol
+        $this.Framing = $Framing
+        $this.TimeoutMs = $TimeoutSeconds * 1000
+    }
+
+    [void]SetTls([System.Security.Cryptography.X509Certificates.X509Certificate2]$ClientCertificate, [string[]]$PinnedFingerprints, [bool]$CheckRevocation, [bool]$SkipCertificateCheck)
+    {
+        $this.ClientCertificate = $ClientCertificate
+        $this.PinnedFingerprints = @($PinnedFingerprints | Where-Object { $_ })
+        $this.CheckRevocation = $CheckRevocation
+        $this.SkipCertificateCheck = $SkipCertificateCheck
+    }
+
+    [string]Label()
+    {
+        return '{0}://{1}:{2}' -f $this.Protocol.ToLowerInvariant(), $this.Server, $this.Port
+    }
+
+    [bool]IsInOutage()
+    {
+        return $this.InOutage
+    }
+
+    [string]Send([byte[]]$Message)
+    {
+        [System.Threading.Monitor]::Enter($this.SyncRoot)
+        try
+        {
+            if ($this.InOutage -and [datetime]::UtcNow -lt $this.RetryAfterUtc)
+            {
+                $this.Dropped++
+                return $null
+            }
+
+            $failure = $null
+            try
+            {
+                $this.SendCore($Message)
+            }
+            catch
+            {
+                $failure = $_.Exception
+            }
+
+            if ($null -ne $failure)
+            {
+                return $this.OnFailure($failure)
+            }
+
+            if ($this.InOutage)
+            {
+                $template = "Syslog sink {0} is reachable again; {1} message(s) were dropped while it wasn't."
+                $recovered = $template -f $this.Label(), $this.Dropped
+                $this.InOutage = $false
+                $this.BackoffSeconds = 0
+                $this.Dropped = 0
+                return $recovered
+            }
+            return $null
+        }
+        finally
+        {
+            [System.Threading.Monitor]::Exit($this.SyncRoot)
+        }
+    }
+
+    # Returns the outage warning on the first failure of an outage, $null after that.
+    hidden [string]OnFailure([System.Exception]$Failure)
+    {
+        $this.CloseConnection()
+        $this.Dropped++
+        $this.LastError = $this.Describe($Failure)
+        $warning = $null
+
+        if ($this.InOutage)
+        {
+            $this.BackoffSeconds = [Math]::Min($this.BackoffSeconds * 2, 60)
+        }
+        else
+        {
+            $this.InOutage = $true
+            $this.BackoffSeconds = 1
+            $template = "Syslog sink {0} failed: {1}. Messages to it are dropped until it's reachable again (retried with backoff, up to every 60 s)."
+            $warning = $template -f $this.Label(), $this.LastError
+        }
+        $this.RetryAfterUtc = [datetime]::UtcNow.AddSeconds($this.BackoffSeconds)
+        return $warning
+    }
+
+    # Innermost exception message, without PowerShell's 'Exception calling "X" with "N"
+    # argument(s)' wrapper.
+    hidden [string]Describe([System.Exception]$Failure)
+    {
+        $message = $Failure.GetBaseException().Message
+        if (-not $message)
+        {
+            $message = $Failure.Message
+        }
+        return $message.Trim()
+    }
+
+    hidden [void]SendCore([byte[]]$Message)
+    {
+        if ($this.Protocol -eq 'Udp')
+        {
+            if ($null -eq $this.Udp)
+            {
+                # Unconnected on purpose: on Windows a connected UDP socket turns the
+                # collector's ICMP port-unreachable into an exception on the next send.
+                $address = $this.ResolveAddresses()[0]
+                $this.Udp = [System.Net.Sockets.UdpClient]::new($address.AddressFamily)
+                $this.UdpEndPoint = [System.Net.IPEndPoint]::new($address, $this.Port)
+            }
+            [void]$this.Udp.Send($Message, $Message.Length, $this.UdpEndPoint)
+            return
+        }
+
+        if ($null -ne $this.Tcp -and -not $this.IsConnected())
+        {
+            $this.CloseConnection()
+        }
+        if ($null -eq $this.Tcp)
+        {
+            $this.Connect()
+        }
+
+        $frame = $this.Frame($Message)
+        $this.Stream.Write($frame, 0, $frame.Length)
+        $this.Stream.Flush()
+    }
+
+    # RFC 6587: octet-counting 'LEN SP MSG' (required for TLS by RFC 5425), or MSG LF.
+    [byte[]]Frame([byte[]]$Message)
+    {
+        if ($this.Framing -eq 'LineFeed')
+        {
+            $framed = [byte[]]::new($Message.Length + 1)
+            [Array]::Copy($Message, $framed, $Message.Length)
+            $framed[$Message.Length] = 0x0A
+            return $framed
+        }
+
+        $length = [System.Text.Encoding]::ASCII.GetBytes(('{0} ' -f $Message.Length))
+        $framed = [byte[]]::new($length.Length + $Message.Length)
+        [Array]::Copy($length, $framed, $length.Length)
+        [Array]::Copy($Message, 0, $framed, $length.Length, $Message.Length)
+        return $framed
+    }
+
+    hidden [System.Net.IPAddress[]]ResolveAddresses()
+    {
+        $ip = $null
+        if ([System.Net.IPAddress]::TryParse($this.Server, [ref]$ip))
+        {
+            return @($ip)
+        }
+        $addresses = [System.Net.Dns]::GetHostAddresses($this.Server)
+        if (-not $addresses -or $addresses.Count -eq 0)
+        {
+            throw "'$($this.Server)' did not resolve to any address"
+        }
+        return $addresses
+    }
+
+    # A socket that's readable with nothing to read means the collector closed the
+    # connection (e.g. it restarted); reconnect instead of writing into it.
+    hidden [bool]IsConnected()
+    {
+        $socket = $this.Tcp.Client
+        if ($null -eq $socket -or -not $socket.Connected)
+        {
+            return $false
+        }
+        if ($socket.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead) -and $socket.Available -eq 0)
+        {
+            return $false
+        }
+        return $true
+    }
+
+    hidden [void]Connect()
+    {
+        $client = $null
+        $lastFailure = $null
+
+        foreach ($address in $this.ResolveAddresses())
+        {
+            if ($null -eq $client)
+            {
+                $candidate = [System.Net.Sockets.TcpClient]::new($address.AddressFamily)
+                try
+                {
+                    $task = $candidate.ConnectAsync($address, $this.Port)
+                    if (-not $task.Wait($this.TimeoutMs))
+                    {
+                        throw [System.TimeoutException]::new(('Timed out connecting to {0} after {1} ms' -f $address, $this.TimeoutMs))
+                    }
+                    $client = $candidate
+                }
+                catch
+                {
+                    $candidate.Dispose()
+                    $lastFailure = $_.Exception
+                }
+            }
+        }
+
+        if ($null -eq $client)
+        {
+            throw $lastFailure
+        }
+
+        $client.NoDelay = $true
+        $client.SendTimeout = $this.TimeoutMs
+        $client.ReceiveTimeout = $this.TimeoutMs
+        $this.Tcp = $client
+        $network = $client.GetStream()
+
+        if ($this.Protocol -ne 'Tls')
+        {
+            $this.Stream = $network
+            return
+        }
+
+        try
+        {
+            $this.Stream = $this.AuthenticateTls($network)
+        }
+        catch
+        {
+            $this.CloseConnection()
+            throw
+        }
+    }
+
+    # TLS 1.2/1.3 only (RFC 9662). Default validation is the chain to a trusted root plus the
+    # name check against $Server, both done by Schannel. Pinning (RFC 5425 section 5.2 fingerprints)
+    # replaces both and is checked here after the handshake, before any message is sent.
+    hidden [System.IO.Stream]AuthenticateTls([System.IO.Stream]$Network)
+    {
+        Initialize-SyslogTlsType
+        $pinning = $this.PinnedFingerprints.Count -gt 0
+        $acceptAny = $this.SkipCertificateCheck -or $pinning
+        $validator = New-Object -TypeName 'LogaPe.SyslogCertificateValidator' -ArgumentList $acceptAny, $this.ClientCertificate
+
+        $ssl = [System.Net.Security.SslStream]::new($Network, $false, $validator.ValidationCallback, $validator.SelectionCallback)
+        $ssl.ReadTimeout = $this.TimeoutMs
+        $ssl.WriteTimeout = $this.TimeoutMs
+
+        $clientCertificates = [System.Security.Cryptography.X509Certificates.X509CertificateCollection]::new()
+        if ($null -ne $this.ClientCertificate)
+        {
+            [void]$clientCertificates.Add($this.ClientCertificate)
+        }
+
+        try
+        {
+            $ssl.AuthenticateAsClient($this.Server, $clientCertificates, $this.TlsProtocols(), $this.CheckRevocation)
+        }
+        catch
+        {
+            $ssl.Dispose()
+            if ($validator.LastError)
+            {
+                throw ('TLS handshake failed: {0}' -f $validator.LastError)
+            }
+            throw
+        }
+
+        if ($pinning)
+        {
+            $fingerprint = ConvertTo-Sha256Hex -Bytes $ssl.RemoteCertificate.GetRawCertData()
+            if ($this.PinnedFingerprints -notcontains $fingerprint)
+            {
+                $ssl.Dispose()
+                throw ("the server certificate's SHA-256 fingerprint {0} matches no -ServerCertificateThumbprint value" -f $fingerprint)
+            }
+        }
+        return $ssl
+    }
+
+    # TLS 1.3 only where the enum value exists (.NET Framework 4.8+, .NET Core 3+); the OS
+    # negotiates the highest version both ends support.
+    [System.Security.Authentication.SslProtocols]TlsProtocols()
+    {
+        $protocols = [System.Security.Authentication.SslProtocols]::Tls12
+        if ([enum]::IsDefined([System.Security.Authentication.SslProtocols], 'Tls13'))
+        {
+            $protocols = [System.Security.Authentication.SslProtocols]([int]$protocols -bor [int][System.Security.Authentication.SslProtocols]'Tls13')
+        }
+        return $protocols
+    }
+
+    # Negotiated TLS version, or '' if not connected over TLS. For tests and diagnostics.
+    [string]NegotiatedProtocol()
+    {
+        if ($this.Stream -is [System.Net.Security.SslStream])
+        {
+            return $this.Stream.SslProtocol.ToString()
+        }
+        return ''
+    }
+
+    hidden [void]CloseConnection()
+    {
+        if ($null -ne $this.Stream)
+        {
+            try { $this.Stream.Dispose() } catch { Write-Debug "Syslog stream dispose failed: $($_.Exception.Message)" }
+            $this.Stream = $null
+        }
+        if ($null -ne $this.Tcp)
+        {
+            try { $this.Tcp.Dispose() } catch { Write-Debug "Syslog TCP dispose failed: $($_.Exception.Message)" }
+            $this.Tcp = $null
+        }
+        if ($null -ne $this.Udp)
+        {
+            try { $this.Udp.Dispose() } catch { Write-Debug "Syslog UDP dispose failed: $($_.Exception.Message)" }
+            $this.Udp = $null
+        }
+    }
+
+    [void]Dispose()
+    {
+        [System.Threading.Monitor]::Enter($this.SyncRoot)
+        try
+        {
+            $this.CloseConnection()
+        }
+        finally
+        {
+            [System.Threading.Monitor]::Exit($this.SyncRoot)
+        }
     }
 }
 
@@ -403,6 +1028,12 @@ class Logger
     hidden [System.Collections.Generic.List[string]] $MaskedFieldNames = [System.Collections.Generic.List[string]]::new()
     hidden [string] $MaskReplacement = '***'
 
+    # Sink warnings waiting for Write-Log to emit them. Write-Warning inside a class method
+    # ignores the caller's -WarningAction/-WarningVariable, so sinks queue their warnings here
+    # and Write-Log writes them from its own (cmdlet) context. Capped so a logger used only
+    # through its methods can't grow it without bound.
+    hidden [System.Collections.Generic.List[string]] $PendingWarnings = [System.Collections.Generic.List[string]]::new()
+
     [LoggingDestination] $LogDestination
 
     Logger([string]$LevelName, [string]$FileName, [string]$FolderPath, [int]$TimeOutSeconds, [string]$Destination)
@@ -500,11 +1131,22 @@ class Logger
     [void]Close()
     {
         $this.LogFileObj.Dispose()
+        foreach ($sink in $this.Sinks)
+        {
+            $sink.Dispose()
+        }
     }
 
     [string]AddSink([string]$Type, [LoggingLevel]$Level, [hashtable]$Config)
     {
+        return $this.AddSink($Type, $Level, $Config, $null, $null)
+    }
+
+    [string]AddSink([string]$Type, [LoggingLevel]$Level, [hashtable]$Config, [object]$Transport, [object]$Formatter)
+    {
         $sink = [LoggingSink]::new($Type, $Level, $Config)
+        $sink.Transport = $Transport
+        $sink.Formatter = $Formatter
         $this.Sinks.Add($sink)
         return $sink.Id
     }
@@ -514,6 +1156,7 @@ class Logger
         $match = $this.Sinks | Where-Object { $_.Id -eq $Id }
         if ($match)
         {
+            $match.Dispose()
             [void]$this.Sinks.Remove($match)
         }
     }
@@ -521,6 +1164,22 @@ class Logger
     [System.Collections.Generic.List[LoggingSink]]GetSinks()
     {
         return $this.Sinks
+    }
+
+    hidden [void]AddPendingWarning([string]$Warning)
+    {
+        if ($Warning -and $this.PendingWarnings.Count -lt 100)
+        {
+            $this.PendingWarnings.Add($Warning)
+        }
+    }
+
+    # Returns and clears the queued sink warnings.
+    [string[]]TakePendingWarnings()
+    {
+        $warnings = $this.PendingWarnings.ToArray()
+        $this.PendingWarnings.Clear()
+        return $warnings
     }
 
     [string]AddMaskRule([string]$Pattern, [string]$Replacement)
@@ -763,7 +1422,10 @@ class Logger
 
     hidden [void]_WriteOutput([string]$Message, [LoggingLevel]$Level, [bool]$WriteConsole, [bool]$WriteFile, [bool]$Bare, [hashtable]$Fields, [array]$ActiveSinks, [bool]$SkipMasking)
     {
-        $formatted = $this.FormatMessage($Message, $Level, $Bare, $Fields, $SkipMasking)
+        # Masking runs once here; the formatted line and the sinks (which may need the message
+        # and fields separately, e.g. syslog) all use the same masked values.
+        $masked = $this.GetMaskedRecord($Message, $Fields, $SkipMasking)
+        $formatted = $this.FormatMessage($masked.Message, $Level, $Bare, $masked.Fields)
 
         if ($WriteConsole)
         {
@@ -784,14 +1446,32 @@ class Logger
 
         foreach ($sink in $ActiveSinks)
         {
-            $this.WriteToSink($sink, $formatted, $Level)
+            $this.WriteToSink($sink, $formatted, $Level, $masked)
         }
     }
 
-    hidden [string]FormatMessage([string]$Message, [LoggingLevel]$Level, [bool]$Bare, [hashtable]$Fields, [bool]$SkipMasking)
+    # Returns @{ Message = masked text; Fields = ordered masked fields, or $null }. With
+    # $SkipMasking the values pass through unchanged.
+    hidden [hashtable]GetMaskedRecord([string]$Message, [hashtable]$Fields, [bool]$SkipMasking)
     {
         $maskedMessage = if ($SkipMasking) { $Message } else { $this.MaskMessage($Message) }
+        $maskedFields = $null
 
+        if ($Fields)
+        {
+            $maskedFields = [ordered]@{}
+            foreach ($key in $Fields.Keys)
+            {
+                $maskedFields[$key] = if ($SkipMasking) { $Fields[$key] } else { $this.MaskFieldValue($key, $Fields[$key]) }
+            }
+        }
+
+        return @{ Message = $maskedMessage; Fields = $maskedFields }
+    }
+
+    # Expects values already masked by GetMaskedRecord.
+    hidden [string]FormatMessage([string]$MaskedMessage, [LoggingLevel]$Level, [bool]$Bare, [System.Collections.Specialized.OrderedDictionary]$MaskedFields)
+    {
         if ($this.OutputFormat -eq 'Json')
         {
             $record = [ordered]@{}
@@ -800,13 +1480,13 @@ class Logger
                 $record['Timestamp'] = Get-Date -Format $this.TimestampFormat
                 $record['Level'] = $Level.Name()
             }
-            $record['Message'] = $maskedMessage
+            $record['Message'] = $MaskedMessage
 
-            if ($Fields)
+            if ($MaskedFields)
             {
-                foreach ($key in $Fields.Keys)
+                foreach ($key in $MaskedFields.Keys)
                 {
-                    $record[$key] = if ($SkipMasking) { $Fields[$key] } else { $this.MaskFieldValue($key, $Fields[$key]) }
+                    $record[$key] = $MaskedFields[$key]
                 }
             }
 
@@ -815,23 +1495,19 @@ class Logger
 
         if ($Bare)
         {
-            $text = $maskedMessage
+            $text = $MaskedMessage
         }
         else
         {
             $text = $this.MessageFormat.
                 Replace('{Timestamp}', (Get-Date -Format $this.TimestampFormat)).
                 Replace('{Level}', $Level.Name().PadLeft(11, ' ')).
-                Replace('{Message}', $maskedMessage)
+                Replace('{Message}', $MaskedMessage)
         }
 
-        if ($Fields)
+        if ($MaskedFields)
         {
-            $fieldText = ($Fields.Keys | ForEach-Object {
-                    $value = if ($SkipMasking) { $Fields[$_] } else { $this.MaskFieldValue($_, $Fields[$_]) }
-                    "$_=$value"
-                }) -join ', '
-            $text = "$text | $fieldText"
+            $text = '{0} | {1}' -f $text, (ConvertTo-LogFieldText -Fields $MaskedFields)
         }
 
         return $text
@@ -872,8 +1548,24 @@ class Logger
     # A write failure here (e.g. the Event Log source was never successfully registered)
     # shouldn't take down the caller's script - warn and move on, same as WriteFile's own
     # failure handling philosophy.
-    hidden [void]WriteToSink([LoggingSink]$Sink, [string]$FormattedMessage, [LoggingLevel]$Level)
+    hidden [void]WriteToSink([LoggingSink]$Sink, [string]$FormattedMessage, [LoggingLevel]$Level, [hashtable]$Masked)
     {
+        if ($Sink.Type -eq 'Syslog')
+        {
+            # The transport handles its own send failures (backoff, one warning per outage) and
+            # never throws; this catch is only for an unexpected formatting error.
+            try
+            {
+                $bytes = $Sink.Formatter.Format($Sink.Config, $Level, $Masked, $this.OutputFormat, [DateTimeOffset]::Now)
+                $this.AddPendingWarning($Sink.Transport.Send($bytes))
+            }
+            catch
+            {
+                $this.AddPendingWarning("Failed to send to syslog sink '$($Sink.Config.Server)': $($_.Exception.Message)")
+            }
+            return
+        }
+
         if ($Sink.Type -eq 'EventLog')
         {
             $levelName = $Level.Name()
@@ -899,7 +1591,7 @@ class Logger
             }
             catch
             {
-                Write-Warning "Failed to write to Event Log sink '$($Sink.Config.Source)': $($_.Exception.Message)"
+                $this.AddPendingWarning("Failed to write to Event Log sink '$($Sink.Config.Source)': $($_.Exception.Message)")
             }
         }
     }
@@ -951,6 +1643,159 @@ function ConvertTo-LogMutexName
 
     $hash = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
     return "LogaPe_$hash"
+}
+
+function ConvertTo-LogFieldText
+{
+    <#
+    .SYNOPSIS
+    Formats -Fields as 'key=value, key=value', the Text layout shared by the log line and the
+    syslog body.
+
+    .PARAMETER Fields
+    The (already masked) fields.
+
+    .OUTPUTS
+    System.String
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [System.Collections.IDictionary]$Fields
+    )
+
+    # String interpolation, not -f: it joins an array value with spaces.
+    $parts = foreach ($key in $Fields.Keys)
+    {
+        "$key=$($Fields[$key])"
+    }
+    return ($parts -join ', ')
+}
+
+function ConvertTo-Sha256Hex
+{
+    <#
+    .SYNOPSIS
+    Returns the SHA-256 hash of a byte array as lower-case hex.
+
+    .DESCRIPTION
+    Uses SHA256CryptoServiceProvider for the same FIPS reason as ConvertTo-LogMutexName. Used
+    for syslog TLS certificate pinning (fingerprints of the server certificate's DER bytes).
+
+    .PARAMETER Bytes
+    The data to hash.
+
+    .OUTPUTS
+    System.String
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [byte[]]$Bytes
+    )
+
+    $sha256 = New-Object System.Security.Cryptography.SHA256CryptoServiceProvider
+    try
+    {
+        $hashBytes = $sha256.ComputeHash($Bytes)
+    }
+    finally
+    {
+        $sha256.Dispose()
+    }
+    return -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+}
+
+# The syslog TLS certificate callbacks, as C# rather than a scriptblock: SslStream may invoke
+# them on a thread with no PowerShell runspace, and a scriptblock delegate then fails or
+# deadlocks. Compiled on the first TLS connect, once per process.
+$script:SyslogTlsSource = @'
+using System;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+
+namespace LogaPe
+{
+    public sealed class SyslogCertificateValidator
+    {
+        private readonly bool _acceptAny;
+        private readonly X509Certificate _clientCertificate;
+
+        // Why the last certificate was rejected, for the sink's warning.
+        public string LastError;
+
+        public SyslogCertificateValidator(bool acceptAny, X509Certificate clientCertificate)
+        {
+            _acceptAny = acceptAny;
+            _clientCertificate = clientCertificate;
+        }
+
+        public RemoteCertificateValidationCallback ValidationCallback { get { return Validate; } }
+
+        public LocalCertificateSelectionCallback SelectionCallback { get { return Select; } }
+
+        private bool Validate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors errors)
+        {
+            if (certificate == null)
+            {
+                LastError = "the server sent no certificate";
+                return false;
+            }
+            if (_acceptAny || errors == SslPolicyErrors.None)
+            {
+                return true;
+            }
+
+            StringBuilder reasons = new StringBuilder();
+            if ((errors & SslPolicyErrors.RemoteCertificateNameMismatch) != 0)
+            {
+                reasons.Append("the certificate does not match the server name; ");
+            }
+            if ((errors & SslPolicyErrors.RemoteCertificateChainErrors) != 0)
+            {
+                reasons.Append("certificate chain:");
+                if (chain != null)
+                {
+                    foreach (X509ChainStatus status in chain.ChainStatus)
+                    {
+                        reasons.Append(' ').Append(status.StatusInformation.Trim());
+                    }
+                }
+                reasons.Append("; ");
+            }
+            LastError = "the server certificate was rejected: " + reasons.ToString().TrimEnd(' ', ';');
+            return false;
+        }
+
+        // Always offer the configured client certificate (mutual TLS), whatever CA list the
+        // server advertises; null means none.
+        private X509Certificate Select(object sender, string targetHost, X509CertificateCollection localCertificates,
+            X509Certificate remoteCertificate, string[] acceptableIssuers)
+        {
+            return _clientCertificate;
+        }
+    }
+}
+'@
+
+function Initialize-SyslogTlsType
+{
+    <#
+    .SYNOPSIS
+    Compiles the syslog TLS certificate callbacks (LogaPe.SyslogCertificateValidator) once per
+    process.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ('LogaPe.SyslogCertificateValidator' -as [type])
+    {
+        return
+    }
+    Add-Type -TypeDefinition $script:SyslogTlsSource -Language CSharp
 }
 
 function Resolve-TargetLogger
@@ -2036,13 +2881,14 @@ function Remove-Logger
 {
     <#
     .SYNOPSIS
-    Disposes a logger's file mutex handle.
+    Disposes a logger's file mutex handle and closes its sinks' connections.
 
     .DESCRIPTION
     Each Logger opens a named Mutex that is never otherwise released for the life of the
-    process. Call this when you're done with a logger in a long-running session (e.g. a
-    service that creates many short-lived loggers) to avoid accumulating open handles. If the
-    logger being removed is the active logger, the active logger is cleared.
+    process, and a syslog sink keeps its socket open. Call this when you're done with a logger
+    in a long-running session (e.g. a service that creates many short-lived loggers) to avoid
+    accumulating open handles. If the logger being removed is the active logger, the active
+    logger is cleared.
 
     .PARAMETER Logger
     The Logger instance to dispose. Defaults to the active logger.
@@ -2156,6 +3002,312 @@ function Add-LoggerEventLogSink
     $target.AddSink('EventLog', [LoggingLevel]::new($Level), $config)
 }
 
+function Add-LoggerSyslogSink
+{
+    <#
+    .SYNOPSIS
+    Sends a logger's messages to a syslog collector as well (UDP, TCP or TLS).
+
+    .DESCRIPTION
+    Registers an independent sink with its own minimum level, like Add-LoggerEventLogSink.
+    Messages are RFC 5424 by default (RFC 3164 with -Format Rfc3164). The syslog header carries
+    the timestamp, severity, host and app name, so the message body is just the masked message
+    and its fields, in the logger's Text or Json layout. Masking applies exactly as it does to
+    the console and file.
+
+    Nothing connects here: the socket opens on the first message at or above -Level and stays
+    open. A failed send never throws into your script. The sink warns once when the collector
+    becomes unreachable, drops messages while it backs off (1 s doubling to 60 s), and warns
+    again when it's back. -Server is only checked to resolve; if it doesn't, you get a warning
+    and the sink is still added.
+
+    TLS (RFC 5425, current practice per RFC 9662) offers TLS 1.2 and 1.3 only. By default the
+    server certificate must chain to a trusted root and match -Server. -ServerCertificateThumbprint
+    pins the certificate's SHA-256 fingerprint instead (works with self-signed certificates),
+    -ClientCertificate adds mutual TLS, and -CheckCertificateRevocation adds CRL/OCSP checks.
+    Prefer TLS for anything that leaves the host: UDP and TCP send in clear text, and UDP can
+    drop messages silently.
+
+    .PARAMETER Server
+    The collector's host name or IP address. For TLS this is also the name the server
+    certificate must match.
+
+    .PARAMETER Port
+    Defaults to 514 for Udp and Tcp, 6514 for Tls.
+
+    .PARAMETER Protocol
+    Udp (default, RFC 5426), Tcp (RFC 6587) or Tls (RFC 5425).
+
+    .PARAMETER Format
+    Rfc5424 (default) or Rfc3164 (legacy BSD, for collectors that only accept it; capped at 1024
+    bytes).
+
+    .PARAMETER Framing
+    Tcp only: OctetCounting (default, 'LEN SP MSG', keeps multi-line messages intact) or
+    LineFeed (each message ends with LF; CR/LF inside a message become spaces). Tls always uses
+    OctetCounting.
+
+    .PARAMETER Facility
+    kern, user (default), mail, daemon, auth, syslog, lpr, news, uucp, cron, authpriv, ftp, ntp,
+    audit, alert, clock, local0-local7.
+
+    .PARAMETER Level
+    Minimum level that reaches this sink. Defaults to 'Warning', like the Event Log sink.
+
+    .PARAMETER AppName
+    APP-NAME (RFC 5424) or TAG (RFC 3164). Defaults to the logger's file name without
+    New-Logger's date prefix, usually the calling script's name.
+
+    .PARAMETER HostName
+    HOSTNAME. Defaults to this computer's fully qualified name.
+
+    .PARAMETER MessageId
+    RFC 5424 MSGID. Defaults to the nil value '-'.
+
+    .PARAMETER StructuredDataId
+    RFC 5424 only. Sends -Fields as structured data, [id key="value" ...], instead of in the
+    message body. Must be 'name@<IANA Private Enterprise Number>', e.g. 'myapp@32473' (32473 is
+    the number reserved for documentation).
+
+    .PARAMETER MaxMessageBytes
+    Longer messages are cut at a character boundary and end with '...[truncated]'. Defaults to
+    2048 for Udp and 8192 for Tcp and Tls.
+
+    .PARAMETER TimeoutSeconds
+    Limit for the TCP connect, the TLS handshake, and each send. Defaults to 2.
+
+    .PARAMETER ClientCertificate
+    Tls only. A certificate with its private key, offered for mutual TLS, e.g.
+    (Get-Item Cert:\CurrentUser\My\<thumbprint>).
+
+    .PARAMETER ServerCertificateThumbprint
+    Tls only. One or more SHA-256 fingerprints (64 hex digits; colons and spaces are ignored).
+    The server is accepted only if its certificate matches one; chain and name checks are
+    skipped. Not the 40-digit SHA-1 'Thumbprint' Windows shows.
+
+    .PARAMETER CheckCertificateRevocation
+    Tls only. Also check revocation (CRL/OCSP). Off by default because many private CAs publish
+    no revocation information.
+
+    .PARAMETER SkipCertificateCheck
+    Tls only. Accept any server certificate. For lab use; adding the sink warns.
+
+    .PARAMETER Logger
+    The Logger instance to add this sink to. Defaults to the active logger.
+
+    .EXAMPLE
+    Add-LoggerSyslogSink -Server 'syslog.example.com' -Protocol Tls -Level Information
+
+    .EXAMPLE
+    Add-LoggerSyslogSink -Server 10.0.0.5 -Facility local3 -Level Error
+
+    .EXAMPLE
+    $cert = Get-Item Cert:\CurrentUser\My\0123456789ABCDEF0123456789ABCDEF01234567
+    Add-LoggerSyslogSink -Server 'syslog.example.com' -Protocol Tls -ClientCertificate $cert
+
+    .OUTPUTS
+    System.String - the new sink's Id, for use with Remove-LoggerSink.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Server,
+
+        [Parameter()]
+        [ValidateRange(1, 65535)]
+        [int]$Port,
+
+        [Parameter()]
+        [ValidateSet('Udp', 'Tcp', 'Tls')]
+        [string]$Protocol = 'Udp',
+
+        [Parameter()]
+        [ValidateSet('Rfc5424', 'Rfc3164')]
+        [string]$Format = 'Rfc5424',
+
+        [Parameter()]
+        [ValidateSet('OctetCounting', 'LineFeed')]
+        [string]$Framing = 'OctetCounting',
+
+        [Parameter()]
+        [ValidateSet('kern', 'user', 'mail', 'daemon', 'auth', 'syslog', 'lpr', 'news', 'uucp', 'cron',
+            'authpriv', 'ftp', 'ntp', 'audit', 'alert', 'clock',
+            'local0', 'local1', 'local2', 'local3', 'local4', 'local5', 'local6', 'local7')]
+        [string]$Facility = 'user',
+
+        [Parameter()]
+        [ValidateSet('None', 'Critical', 'Error', 'Warning', 'Information', 'Debug', 'Verbose', 'Trace')]
+        [string]$Level = 'Warning',
+
+        [Parameter()]
+        [string]$AppName,
+
+        [Parameter()]
+        [string]$HostName,
+
+        [Parameter()]
+        [string]$MessageId,
+
+        [Parameter()]
+        [string]$StructuredDataId,
+
+        [Parameter()]
+        [ValidateRange(480, 1048576)]
+        [int]$MaxMessageBytes,
+
+        [Parameter()]
+        [ValidateRange(1, 300)]
+        [int]$TimeoutSeconds = 2,
+
+        [Parameter()]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$ClientCertificate,
+
+        [Parameter()]
+        [string[]]$ServerCertificateThumbprint,
+
+        [Parameter()]
+        [switch]$CheckCertificateRevocation,
+
+        [Parameter()]
+        [switch]$SkipCertificateCheck,
+
+        [Parameter()]
+        [Logger]$Logger
+    )
+
+    $isTls = $Protocol -eq 'Tls'
+    foreach ($tlsOnly in 'ClientCertificate', 'ServerCertificateThumbprint', 'CheckCertificateRevocation', 'SkipCertificateCheck')
+    {
+        if ($PSBoundParameters.ContainsKey($tlsOnly) -and -not $isTls)
+        {
+            throw "-$tlsOnly needs -Protocol Tls."
+        }
+    }
+    if ($Framing -eq 'LineFeed' -and $Protocol -ne 'Tcp')
+    {
+        throw '-Framing LineFeed is only for -Protocol Tcp. TLS always uses octet-counting (RFC 5425), and UDP has no framing.'
+    }
+    if ($SkipCertificateCheck -and ($ServerCertificateThumbprint -or $CheckCertificateRevocation))
+    {
+        throw '-SkipCertificateCheck cannot be combined with -ServerCertificateThumbprint or -CheckCertificateRevocation.'
+    }
+    if ($ClientCertificate -and -not $ClientCertificate.HasPrivateKey)
+    {
+        throw "-ClientCertificate '$($ClientCertificate.Subject)' has no private key, so it can't be used for mutual TLS."
+    }
+    if ($StructuredDataId)
+    {
+        if ($Format -ne 'Rfc5424')
+        {
+            throw '-StructuredDataId needs -Format Rfc5424; RFC 3164 has no structured data.'
+        }
+        if ($StructuredDataId -notmatch '^[\x21-\x7E-[=\]"@ ]]{1,32}@\d+(\.\d+)*$' -or $StructuredDataId.Length -gt 32)
+        {
+            throw "-StructuredDataId '$StructuredDataId' must be name@<enterprise number> (at most 32 characters, no space, '=', ']' or '`"'), e.g. 'myapp@32473'."
+        }
+    }
+
+    $pins = @()
+    foreach ($thumbprint in $ServerCertificateThumbprint)
+    {
+        $normalized = ($thumbprint -replace '[\s:]', '').ToLowerInvariant()
+        if ($normalized -notmatch '^[0-9a-f]{64}$')
+        {
+            throw "-ServerCertificateThumbprint '$thumbprint' isn't a SHA-256 fingerprint (64 hex digits). The 40-digit Windows 'Thumbprint' is SHA-1 and isn't accepted."
+        }
+        $pins += $normalized
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('Port'))
+    {
+        $Port = if ($isTls) { 6514 } else { 514 }
+    }
+    if (-not $PSBoundParameters.ContainsKey('MaxMessageBytes'))
+    {
+        $MaxMessageBytes = if ($Protocol -eq 'Udp') { 2048 } else { 8192 }
+    }
+    elseif ($Protocol -eq 'Udp' -and $MaxMessageBytes -gt 65507)
+    {
+        throw '-MaxMessageBytes can be at most 65507 for UDP (the largest UDP payload).'
+    }
+    # A new variable: $Framing keeps its ValidateSet, which has no 'None'.
+    $effectiveFraming = $Framing
+    if ($Protocol -ne 'Tcp')
+    {
+        $effectiveFraming = if ($isTls) { 'OctetCounting' } else { 'None' }
+    }
+
+    $target = Resolve-TargetLogger -Logger $Logger
+
+    if (-not $PSBoundParameters.ContainsKey('AppName'))
+    {
+        $AppName = [System.IO.Path]::GetFileNameWithoutExtension($target.GetLoggingFile()) -replace '^\d{4}-\d{2}-\d{2}_', ''
+    }
+    if (-not $PSBoundParameters.ContainsKey('HostName'))
+    {
+        # Computed once here rather than per message. GetHostName keeps the real (not
+        # NetBIOS-truncated) name; the domain comes from the TCP/IP settings, not DNS.
+        $HostName = [System.Net.Dns]::GetHostName()
+        $domain = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().DomainName
+        if ($domain -and $HostName -notmatch '\.')
+        {
+            $HostName = '{0}.{1}' -f $HostName, $domain
+        }
+    }
+
+    $label = '{0}://{1}:{2}' -f $Protocol.ToLowerInvariant(), $Server, $Port
+    if (-not $PSCmdlet.ShouldProcess($target.GetLoggingFullPath(), "Add syslog sink ($label)"))
+    {
+        return $null
+    }
+
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($Server, [ref]$ip))
+    {
+        try
+        {
+            [void][System.Net.Dns]::GetHostAddresses($Server)
+        }
+        catch
+        {
+            Write-Warning "Syslog server '$Server' doesn't resolve right now ($($_.Exception.GetBaseException().Message)). The sink is still added; sends retry with backoff until it does."
+        }
+    }
+    if ($SkipCertificateCheck)
+    {
+        Write-Warning "Syslog sink $label accepts any server certificate (-SkipCertificateCheck). Use this only in a lab: anyone in the path can read and alter the messages."
+    }
+
+    $config = @{
+        Server                      = $Server
+        Port                        = $Port
+        Protocol                    = $Protocol
+        Format                      = $Format
+        Framing                     = $effectiveFraming
+        Facility                    = $Facility
+        AppName                     = $AppName
+        HostName                    = $HostName
+        MessageId                   = $MessageId
+        StructuredDataId            = $StructuredDataId
+        MaxMessageBytes             = $MaxMessageBytes
+        TimeoutSeconds              = $TimeoutSeconds
+        ClientCertificate           = if ($ClientCertificate) { $ClientCertificate.Thumbprint } else { $null }
+        ServerCertificateThumbprint = $pins
+        CheckCertificateRevocation  = $CheckCertificateRevocation.IsPresent
+        SkipCertificateCheck        = $SkipCertificateCheck.IsPresent
+    }
+
+    $transport = [SyslogTransport]::new($Server, $Port, $Protocol, $effectiveFraming, $TimeoutSeconds)
+    if ($isTls)
+    {
+        $transport.SetTls($ClientCertificate, $pins, $CheckCertificateRevocation.IsPresent, $SkipCertificateCheck.IsPresent)
+    }
+
+    $target.AddSink('Syslog', [LoggingLevel]::new($Level), $config, $transport, [SyslogFormatter]::new())
+}
+
 function Get-LoggerSink
 {
     <#
@@ -2194,7 +3346,7 @@ function Remove-LoggerSink
     <#
     .SYNOPSIS
     Removes a sink previously added with an Add-Logger*Sink function (e.g.
-    Add-LoggerEventLogSink).
+    Add-LoggerEventLogSink or Add-LoggerSyslogSink), closing any connection it holds.
 
     .PARAMETER Id
     The sink's Id, as returned by the function that added it, or from Get-LoggerSink.
@@ -2667,6 +3819,13 @@ function Write-Log
         }
 
         $target.Write($effectiveMessage, $levelObj, $destinationObj, $Bare.IsPresent, $Fields, $SkipMasking.IsPresent)
+
+        # Sink warnings are queued by the class and written here, so -WarningAction,
+        # -WarningVariable and $WarningPreference apply to them.
+        foreach ($warning in $target.TakePendingWarnings())
+        {
+            Write-Warning $warning
+        }
     }
 }
 
@@ -2676,6 +3835,7 @@ Export-ModuleMember -Function @(
     'New-Logger'
     'Remove-Logger'
     'Add-LoggerEventLogSink'
+    'Add-LoggerSyslogSink'
     'Get-LoggerSink'
     'Remove-LoggerSink'
     'Write-Log'

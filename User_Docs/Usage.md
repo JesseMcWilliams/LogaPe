@@ -14,7 +14,9 @@ versions of most of what's below, see [Examples/](../Examples/).
 - [Exception-aware logging](#exception-aware-logging)
 - [Native PowerShell streams](#native-powershell-streams)
 - [Reading and tailing the log](#reading-and-tailing-the-log)
-- [Additional sinks (Windows Event Log)](#additional-sinks-windows-event-log)
+- [Additional sinks](#additional-sinks)
+  - [Windows Event Log](#windows-event-log)
+  - [Syslog](#syslog)
 - [Masking sensitive values](#masking-sensitive-values)
 - [Cleaning up](#cleaning-up)
 - [Function reference](#function-reference)
@@ -132,10 +134,15 @@ Get-LoggerContent -AsObject | Where-Object Level -eq 'Error'   # parse Json-form
 `-AsObject` parses each line as JSON (for loggers using `-OutputFormat Json`); a line that
 isn't valid JSON comes back as its raw string with a warning instead of aborting the read.
 
-## Additional sinks (Windows Event Log)
+## Additional sinks
 
 A sink is an independent output alongside Console/File, with its own minimum level - e.g. only
-send Critical/Error to the Event Log while the file keeps capturing everything at Verbose:
+send Critical/Error to the Event Log while the file keeps capturing everything at Verbose.
+`Get-LoggerSink` lists every sink registered on a logger, and `Remove-LoggerSink` removes one.
+A sink that fails never throws into your script: it warns instead, and `Write-Log`'s
+`-WarningAction`/`-WarningVariable` apply to those warnings.
+
+### Windows Event Log
 
 ```powershell
 $sinkId = Add-LoggerEventLogSink -Source 'MyApp' -Level Error
@@ -148,8 +155,65 @@ If `-Source` isn't already a registered event source, `Add-LoggerEventLogSink` t
 register it via `[System.Diagnostics.EventLog]::CreateEventSource` (not `New-EventLog`, which
 PowerShell 7 doesn't have), which needs local administrator rights. Without them, it warns
 and explains how to pre-register the source manually — the sink is still added, and later
-writes fail individually (with their own warning) rather than throwing. `Get-LoggerSink` lists
-every sink registered on a logger.
+writes fail individually (with their own warning) rather than throwing.
+
+### Syslog
+
+`Add-LoggerSyslogSink` sends messages to a syslog collector (rsyslog, syslog-ng, a SIEM) over
+UDP, TCP or TLS:
+
+```powershell
+# TLS (RFC 5425): the server certificate must chain to a trusted root and match -Server.
+$sinkId = Add-LoggerSyslogSink -Server 'syslog.example.com' -Protocol Tls -Level Information
+
+Write-Log 'user signed in' -Fields @{ UserId = 42 }
+# <14>1 2026-10-12T16:36:12.192505-07:00 web01.example.com MyScript 6436 - - user signed in | UserId=42
+```
+
+Messages are RFC 5424 by default. The header carries the timestamp (with its UTC offset),
+severity, host, app name and process ID, so the body is only the message and its fields: in
+the logger's `Text` layout (`message | key=value`) or, with `-OutputFormat Json`, as compact
+JSON. Masking applies exactly as for the console and file.
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `-Protocol` | `Udp` | `Udp` (RFC 5426), `Tcp` (RFC 6587) or `Tls` (RFC 5425). UDP and TCP are clear text, and UDP can drop messages silently; use TLS for anything that leaves the host. |
+| `-Port` | 514, or 6514 for TLS | |
+| `-Format` | `Rfc5424` | `Rfc3164` for old collectors that only accept the BSD format (short host name, local time, capped at 1024 bytes). |
+| `-Facility` | `user` | `kern` … `clock`, `local0` … `local7`. |
+| `-Level` | `Warning` | Minimum level sent. Critical → `crit`, Error → `err`, Warning → `warning`, Information → `info`, Debug/Verbose/Trace → `debug`. |
+| `-AppName` | The log file name without `New-Logger`'s date prefix | Usually the calling script's name. |
+| `-HostName` | This computer's fully qualified name | |
+| `-MessageId` | `-` (none) | RFC 5424 MSGID. |
+| `-Framing` | `OctetCounting` | TCP only. `LineFeed` ends each message with LF and turns line breaks inside it into spaces; octet-counting keeps multi-line messages (e.g. stack traces) intact. TLS always uses octet-counting. |
+| `-StructuredDataId` | none | Sends `-Fields` as RFC 5424 structured data, `[id key="value" ...]`, instead of in the body. Must be `name@<IANA enterprise number>`; 32473 is reserved for documentation, e.g. `myapp@32473`. |
+| `-MaxMessageBytes` | 2048 for UDP, 8192 for TCP/TLS | Longer messages are cut at a character boundary and end with `...[truncated]`. |
+| `-TimeoutSeconds` | 2 | Limit for the connect, the TLS handshake and each send. |
+
+**TLS options.** Only TLS 1.2 and 1.3 are offered, and the OS chooses the cipher suite.
+
+```powershell
+# Pin the collector's certificate instead of validating its chain (works with self-signed
+# certificates). This is the SHA-256 fingerprint (64 hex digits), not Windows' SHA-1 Thumbprint:
+#   openssl x509 -in server.crt -noout -fingerprint -sha256
+Add-LoggerSyslogSink -Server 10.0.0.5 -Protocol Tls -ServerCertificateThumbprint 'AB:CD:...'
+
+# Mutual TLS: present a client certificate (with its private key) to collectors that require one.
+$cert = Get-Item Cert:\CurrentUser\My\0123456789ABCDEF0123456789ABCDEF01234567
+Add-LoggerSyslogSink -Server 'syslog.example.com' -Protocol Tls -ClientCertificate $cert
+
+# Also check revocation (CRL/OCSP). Off by default: many private CAs publish none.
+Add-LoggerSyslogSink -Server 'syslog.example.com' -Protocol Tls -CheckCertificateRevocation
+```
+
+`-SkipCertificateCheck` accepts any certificate. It's for labs only, and adding the sink warns.
+
+**When the collector is unreachable.** Nothing connects until the first message at or above
+`-Level`; the connection then stays open and reconnects if the collector restarts. If a send
+fails, the sink warns once, then drops messages without trying while it backs off (1 s,
+doubling to 60 s), so an outage costs your script one timeout rather than one per message.
+When a send succeeds again, it warns once more with the number of messages dropped.
+`Remove-LoggerSink` and `Remove-Logger` close the connection.
 
 ## Masking sensitive values
 
@@ -241,8 +305,9 @@ always uses the logger-level default.
 
 ## Cleaning up
 
-Each logger opens a named mutex that otherwise lives for the process's lifetime. If you create
-many short-lived loggers in a long-running session, dispose them when done:
+Each logger opens a named mutex that otherwise lives for the process's lifetime, and a syslog
+sink keeps its connection open. If you create many short-lived loggers in a long-running
+session, dispose them when done:
 
 ```powershell
 Remove-Logger -Logger $logger
@@ -253,7 +318,7 @@ Remove-Logger -Logger $logger
 | Function | Purpose |
 |---|---|
 | `New-Logger` | Create a logger |
-| `Remove-Logger` | Dispose a logger's mutex handle |
+| `Remove-Logger` | Dispose a logger's mutex handle and close its sinks' connections |
 | `Write-Log` | Write a message |
 | `Get-ActiveLogger` / `Set-ActiveLogger` | Read/set the module's active logger |
 | `Get-LoggerLevel` / `Set-LoggerLevel` | Read/set the minimum level (optionally per-destination) |
@@ -268,6 +333,7 @@ Remove-Logger -Logger $logger
 | `Get-LoggerMessageFormat` / `Set-LoggerMessageFormat` | Read/set the Text template and timestamp format |
 | `Get-LoggerNativeStreamMode` / `Set-LoggerNativeStreamMode` | Read/set native-stream console output |
 | `Add-LoggerEventLogSink` | Add a Windows Event Log sink with its own minimum level |
+| `Add-LoggerSyslogSink` | Add a syslog sink (UDP, TCP or TLS) with its own minimum level |
 | `Get-LoggerSink` / `Remove-LoggerSink` | List / remove a logger's sinks |
 | `Add-LoggerMaskRule` / `Get-LoggerMaskRule` / `Remove-LoggerMaskRule` | Add/list/remove a regex-based message-text masking rule |
 | `Add-LoggerMaskField` / `Get-LoggerMaskField` / `Remove-LoggerMaskField` | Add/list/remove a masked `-Fields` key name |

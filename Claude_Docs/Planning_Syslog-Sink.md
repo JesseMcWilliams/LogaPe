@@ -4,8 +4,14 @@
 > is implemented yet. Once it ships, move the design into a new numbered section of
 > `Design_Architecture.md` and rename this file `Archive_Planning_Syslog-Sink.md`.
 
-Status: **Draft, 2026-10-12.** Decisions marked *(proposed)* need confirmation. The open questions
-are listed in §9 and tracked as questions 1–7 in [Planning_Questions.md](Planning_Questions.md).
+Status: **Final, 2026-10-12.** Questions 1–7 are answered (§9): every *(proposed)* choice was
+accepted, and the user asked for current best practice throughout, which added §3.2's TLS
+requirements (RFC 9662, mutual TLS, certificate pinning). The live test runs against a collector
+VM deployed by LABaPe (§6).
+
+Progress: phases 1–6 (§7) are built and tested on loopback on both editions; what shipped is
+in `Design_Architecture.md` §12. Phase 7 (the lab live test) is next. Archive this plan once it
+passes.
 
 ## 1. Goal
 
@@ -59,6 +65,12 @@ Header field rules for RFC 5424, enforced by the formatter:
   up to 32.
 - An empty value is written as the nil value `-`.
 - Spaces and non-ASCII characters are removed from header fields, not escaped.
+- MSG is UTF-8. When it contains any non-ASCII character it starts with a byte order mark, as
+  RFC 5424 §6.4 requires for UTF-8 messages. A pure-ASCII MSG is sent without one (valid as
+  `MSG-ANY`), so most messages look the same on every collector.
+
+RFC 3164 rules: HOSTNAME is the short host name (no domain, as §4.1.2 requires), TAG is at most
+32 alphanumeric characters, and the month names are always English.
 
 ### 3.2 Transports
 
@@ -68,14 +80,33 @@ Header field rules for RFC 5424, enforced by the formatter:
 | **TCP** (RFC 6587) | 514 | Octet-counting (`LEN SP MSG`) by default; LF-terminated ("non-transparent") as an option | Reliable while connected. Multi-line messages are only safe with octet-counting. |
 | **TLS** (RFC 5425) | 6514 | Octet-counting (required by RFC 5425) | `SslStream` over TCP. The server certificate is validated by default. |
 
-TLS details:
+TLS details (current best practice: RFC 5425 as updated by RFC 9662, and RFC 9325):
 
-- **Protocols.** Request TLS 1.2, plus TLS 1.3 where the enum value exists and the OS supports
-  it. On .NET Framework, the default `SslProtocols` can exclude TLS 1.2, depending on registry
-  settings. Uses Schannel, so it's fine on FIPS-enforcing hosts.
-- **Certificate validation.** On by default. `-SkipCertificateCheck` is for lab use only, and
-  using it writes a warning when the sink is added.
-- **Client certificates.** Mutual TLS with `-ClientCertificate` is a later addition (§9 Q1).
+- **Protocols.** TLS 1.2 and TLS 1.3 only. SSL 3, TLS 1.0 and TLS 1.1 are never offered.
+  TLS 1.3 is requested only where the `SslProtocols.Tls13` enum value exists, and the OS
+  negotiates the highest version both ends support. Naming the versions explicitly matters on
+  .NET Framework, whose default `SslProtocols` can exclude TLS 1.2, depending on registry
+  settings.
+- **Cipher suites.** Left to the OS (Schannel), which prefers forward-secret AEAD suites such as
+  `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`, the suite RFC 9662 makes mandatory. Schannel is
+  FIPS-validated, so the sink works on FIPS-enforcing hosts.
+- **Server authentication, default.** The certificate chain must validate to a trusted root,
+  and the certificate must match `-Server` (subject alternative name). Schannel checks both.
+- **Revocation.** `-CheckCertificateRevocation` also checks CRL/OCSP. It's off by default,
+  because many private and lab CAs publish no revocation information, and then every connection
+  would fail.
+- **Certificate pinning.** `-ServerCertificateThumbprint` accepts the server only if its
+  certificate's SHA-256 fingerprint matches one of the given values. This is RFC 5425 §5.2's
+  fingerprint authentication, and it works with self-signed certificates. It replaces chain and
+  name validation.
+- **Mutual TLS.** `-ClientCertificate` (an `X509Certificate2` with a private key, e.g. from
+  `Cert:\CurrentUser\My`) is offered to collectors that ask for one (RFC 5425 §4.2.1).
+- **`-SkipCertificateCheck`.** Accepts any server certificate. Lab use only; adding the sink
+  writes a warning.
+- **The validation callback** is a small C# class compiled with `Add-Type` the first time a TLS
+  sink connects, not a PowerShell scriptblock. A scriptblock delegate needs a runspace on the
+  calling thread and can deadlock when another runspace is busy. The callback also records why a
+  certificate was rejected, so the warning can say so.
 
 ### 3.3 Severity and facility mapping
 
@@ -89,6 +120,7 @@ PRI = facility × 8 + severity.
 | Information | 6 `info` |
 | Debug | 7 `debug` |
 | Verbose / Trace | 7 `debug` |
+| None (used as a message level) | 6 `info` |
 
 LogaPe has no levels that map to `emerg` (0), `alert` (1) or `notice` (5), so those severities
 are never sent.
@@ -103,7 +135,7 @@ are never sent.
 | Field | Default | Override |
 |---|---|---|
 | HOSTNAME | FQDN, computed once when the sink is added: `$env:COMPUTERNAME` plus `IPGlobalProperties.DomainName`. Not a DNS lookup on every write. | `-HostName` |
-| APP-NAME / TAG | The logger's file base name (the calling script's name, already resolved by `New-Logger`) | `-AppName` |
+| APP-NAME / TAG | The logger's file base name without `New-Logger`'s `yyyy-MM-dd_` prefix (usually the calling script's name) | `-AppName` |
 | PROCID | `$PID` | none |
 | MSGID | `-` | `-MessageId` |
 
@@ -121,9 +153,13 @@ are never sent.
 ### 4.3 Connections, failures and thread safety
 
 - **Connection lifetime.** One socket per sink, opened lazily on the first write and kept open.
-  UDP uses a connected `UdpClient`, so the server name is resolved once and re-resolved on error.
-- **Timeouts.** TCP and TLS have a connect timeout (default 2 s) and a `SendTimeout` (default
-  2 s), so a stalled collector can't hang the caller indefinitely.
+  The server name is resolved once and re-resolved after an error. UDP sends to the resolved
+  endpoint without `Connect()`: on Windows, a connected UDP socket turns a collector's ICMP
+  "port unreachable" into an exception on the next send. Before each TCP/TLS send, a closed
+  connection (the collector restarted) is detected with `Socket.Poll` and reopened, so the
+  message isn't written into a dead socket.
+- **Timeouts.** `-TimeoutSeconds` (default 2) limits the TCP connect, the TLS handshake and
+  each send, so a stalled collector can't hang the caller indefinitely.
 - **Backoff after a failure.** After a failed connect or send, the transport is marked down until
   a retry time. Writes during that window are dropped immediately instead of each one waiting
   for a timeout. The backoff doubles from 1 s up to 60 s, and the next write after the window
@@ -132,8 +168,10 @@ are never sent.
   connection comes back. This differs from the Event Log sink, which warns on every failed write.
   For a network sink, per-message warnings would flood the console.
 - **Thread safety.** Each send runs inside `[System.Threading.Monitor]::Enter/Exit` on the
-  transport, so two runspaces sharing a logger can't interleave TCP frames. Each UDP datagram is
-  already atomic.
+  transport's lock object, so two threads sharing a sink can't interleave TCP frames. Each UDP
+  datagram is already atomic. Sharing one `Logger` object across runspaces isn't a supported
+  pattern in LogaPe (PowerShell class methods have affinity to the runspace that created the
+  object), so the concurrency test gives each runspace its own logger, as the file test does.
 - **Process safety.** Each process has its own socket. The collector sees independent streams,
   so the per-file mutex isn't involved.
 - **Delivery model.** v1 sends synchronously (§9 Q5). A background queue would hide latency but
@@ -176,15 +214,23 @@ Add-LoggerSyslogSink
     [-AppName <string>] [-HostName <string>] [-MessageId <string>]
     [-StructuredDataId <string>]
     [-MaxMessageBytes <int>]
-    [-ConnectTimeoutSeconds <int>]        # default 2
+    [-TimeoutSeconds <int>]               # connect, handshake and send; default 2
+    [-ClientCertificate <X509Certificate2>]       # TLS only: mutual TLS
+    [-ServerCertificateThumbprint <string[]>]     # TLS only: SHA-256 pinning
+    [-CheckCertificateRevocation]                 # TLS only
     [-SkipCertificateCheck]               # TLS only; warns when used
     [-Logger <Logger>]
     [-WhatIf] [-Confirm]
 # Returns the sink Id (string), like Add-LoggerEventLogSink.
 ```
 
-- **Validation.** `-Framing LineFeed` with `-Protocol Tls`, or `-SkipCertificateCheck` without
-  TLS, is an error.
+- **Validation.** These are errors: `-Framing LineFeed` with `-Protocol Tls`; any TLS-only
+  parameter without `-Protocol Tls`; `-SkipCertificateCheck` together with
+  `-ServerCertificateThumbprint` or `-CheckCertificateRevocation`; a `-ClientCertificate`
+  without a private key; a thumbprint that isn't 64 hex digits (colons and spaces are ignored);
+  a `-StructuredDataId` that isn't `name@number`.
+- **LineFeed framing** replaces CR and LF inside a message with spaces, since a newline ends the
+  frame. Octet-counting keeps multi-line messages intact.
 - **When the server is checked.** `Add-LoggerSyslogSink` doesn't connect. It only validates
   that `-Server` resolves, and warns if it doesn't, without failing. This matches the Event Log
   sink's "warn but still add" behaviour, and it means a collector that's down at startup can't
@@ -205,19 +251,22 @@ Everything below runs on loopback with no external server. It runs on 5.1 and un
 | Formatter, RFC 3164 | Check the space-padded day, the `TAG[PID]:` layout and the 1024-byte cap. |
 | UDP end to end | A `UdpClient` bound to `127.0.0.1:0` (an ephemeral port), then `Add-LoggerSyslogSink -Port <that port>`, then `Write-Log`. Receive with a timeout and check the bytes. |
 | TCP end to end | A `TcpListener` on loopback. Check both framings, and that a multi-line message arrives as one octet-counted frame. |
-| TLS end to end | A self-signed certificate created in the test and removed in `AfterAll`, and an `SslStream` server in a background runspace. Check that the default validation rejects the certificate and that `-SkipCertificateCheck` accepts it. If creating a certificate isn't possible on a host, skip with a reason, the same way the Event Log tests handle missing admin rights (Lessons-Learned § Testing). |
+| TLS end to end | A self-signed certificate made in memory with `CertificateRequest` (no certificate store is touched), and an `SslStream` server in a background runspace. Check that the default validation rejects it, that `-SkipCertificateCheck` and a matching `-ServerCertificateThumbprint` accept it, that a wrong thumbprint rejects it, that the negotiated protocol is TLS 1.2 or 1.3, and that a server requiring a client certificate receives the one given by `-ClientCertificate`. |
 | Level filtering | Nothing arrives below the sink's level. |
 | Masking | A default-masking rule's secret never appears in the received bytes, for Text, Json and structured-data bodies. `-SkipMasking` sends the value unmasked. |
 | Failure handling | A TCP sink pointed at a closed port: `Write-Log` doesn't throw, warns once over several writes, and returns quickly while backed off (measure the elapsed time). |
 | Lifecycle | `Remove-LoggerSink` and `Remove-Logger` dispose the socket, and the listener sees the connection close. |
-| Concurrency | Two runspaces write 200 messages each through one TCP sink. Every frame parses, so none interleaved. |
+| Concurrency | Several runspaces, each with its own logger and TCP sink, write to one listener. Every frame parses and none are lost. |
 
 Example `Examples/08-SyslogSink.ps1` starts a loopback UDP listener, adds a sink, logs a few
 levels and prints what the listener received. That way `Examples.Tests.ps1` smoke-tests it on
 both editions without a real collector. `Examples/README.md` gets a row for it.
 
-**Live test (lab).** Send to a real rsyslog or syslog-ng server over UDP, TCP and TLS, and
-confirm on the server that the severity, facility, host and app name parse correctly
+**Live test (lab).** The lab has no syslog collector, so LABaPe deploys a Linux VM with a
+syslog collector role (rsyslog listening on UDP 514, TCP 514 and TLS 6514, with a certificate
+from LABaPe's platform CA). That role is LABaPe work and is tracked in the LABaPe repository.
+LogaPe sends to it over UDP, TCP and TLS (with chain validation, pinning, and mutual TLS), and
+the test confirms on the server that the severity, facility, host and app name parse correctly
 (§9 Q7).
 
 ## 7. Implementation phases
@@ -253,25 +302,21 @@ Each phase leaves the full suite at 100% and works on both editions.
 | Secrets leave the host | Masking runs before the sink, the same as for every output, and is covered by tests. Recommend TLS in the docs for anything off-host. |
 | UDP silently drops messages | Documented. Recommend TCP or TLS when delivery matters. |
 | `SslStream` behaves differently on .NET Framework and .NET 7+ (protocol defaults, the `Tls13` enum) | Choose protocols explicitly, and run the TLS tests on both editions. |
-| A PowerShell scriptblock as the certificate-validation callback runs on another thread | Use the synchronous `AuthenticateAsClient`, so the callback runs on the calling thread. Implement `-SkipCertificateCheck` as a small static C# delegate if a scriptblock proves unreliable. |
+| A PowerShell scriptblock as the certificate-validation callback needs a runspace and can deadlock | The callback is a small C# class (`Add-Type`, compiled once per process on the first TLS connect), so it runs on any thread. `Add-Type` takes about a second on 5.1; only TLS sinks pay it. |
 | More code in a 2,700-line file | Expected and accepted (§10). The two new classes stay self-contained. |
 
 ## 9. Open questions
 
-These are tracked, with the same numbers, in [Planning_Questions.md](Planning_Questions.md).
-Record each answer here, in the section it affects, when it's decided.
+All answered 2026-10-12 (questions 1–7 in [Planning_Questions.md](Planning_Questions.md)). The
+user accepted every proposal and asked for current best practice throughout.
 
-1. **Transports in v1.** UDP, TCP and TLS all in v1 *(proposed)*, or UDP and TCP first with TLS
-   in a follow-up? Is mutual TLS (`-ClientCertificate`) needed now?
-2. **Default format.** RFC 5424 *(proposed)*, or RFC 3164 for compatibility with an existing
-   collector?
-3. **Fields.** In the body by default, with structured data only through `-StructuredDataId`
-   *(proposed)*? Or do you have an IANA enterprise number to use as the default SD-ID?
-4. **Body content.** Just the message and fields, without LogaPe's timestamp and level prefix
-   *(proposed)*? Or the fully formatted line, the same as the Event Log sink?
-5. **Delivery model.** Synchronous with timeouts and backoff *(proposed)*, or a background queue
-   from the start?
-6. **Default facility.** `user` *(proposed)*, or `local0`–`local7` to fit an existing routing
-   scheme?
-7. **Live testing.** Is there a syslog collector in the lab, and which product? If there isn't,
-   should the live test stand one up (for example, rsyslog on the existing Linux target)?
+1. **Transports in v1.** UDP, TCP and TLS. Mutual TLS is in v1 too, as part of best practice
+   (§3.2).
+2. **Default format.** RFC 5424. RFC 3164 stays available with `-Format Rfc3164`.
+3. **Fields.** In the body by default; structured data only through `-StructuredDataId`. There
+   is no IANA enterprise number to use as a default.
+4. **Body content.** The message and fields only, without LogaPe's timestamp and level prefix.
+5. **Delivery model.** Synchronous, with timeouts and backoff.
+6. **Default facility.** `user`.
+7. **Live testing.** There is no collector in the lab. Deploy a VM with a collector role through
+   LABaPe (§6).
