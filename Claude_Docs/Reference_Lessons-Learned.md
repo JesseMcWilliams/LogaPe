@@ -7,6 +7,37 @@ not just a line in this file.
 
 ## PowerShell Classes
 
+### A static class method breaks once another runspace has imported the module
+
+**Symptom:** after the syslog refactor, eight masking tests failed with
+`NullReferenceException` inside `ScriptBlock.InvokeWithPipe`, called from
+`InvokeAsMemberFunctionT`. They passed when run on their own. The failing line called a new
+static method, `[Logger]::FormatFieldText(...)`.
+
+**Root cause:** PowerShell reuses the compiled class types when the same module file is
+imported again in the same process, and a static method is bound to the session state of the
+last runspace that imported it. The earlier `Get-LoggerContent -Wait` test imports the module
+in a background runspace and then disposes it. After that, every call to the static method
+from the main runspace has no session state to run in.
+
+**Rule:** don't give module classes static methods (or static properties with initializers that
+call PowerShell code). Use instance methods, or a module function for shared helpers
+(`ConvertTo-LogFieldText`). Constructors such as `[Logger]::new()` are unaffected.
+
+### `Write-Warning` inside a class method ignores the caller's warning preferences
+
+**Symptom:** a syslog sink's outage warning appeared on the console, but
+`Write-Log ... -WarningVariable w -WarningAction SilentlyContinue` neither captured it nor
+silenced it. The Event Log sink had the same problem, so its test "no warning below the sink's
+level" could never fail.
+
+**Root cause:** a class method has no `$PSCmdlet`, so its `Write-Warning` goes out under the
+module's own preferences, not those of the cmdlet that called into the class.
+
+**Rule:** class code that needs to warn returns or queues the text, and the public function
+writes it (`Logger.PendingWarnings`, emitted by `Write-Log`). Test warning behavior through the
+public function with `-WarningVariable`.
+
 ### A `class` type used as a parameter/return type must live in the same file as the code that references it
 
 **Symptom:** `Unable to find type [Logger]` when importing a module that dot-sources separate
@@ -40,6 +71,13 @@ a real PowerShell/class interaction quirk.
 `LoggingLevel.LevelToInt`) is fine - it's specifically `break` that's the problem.
 
 ## PowerShell Language Gotchas
+
+### A parameter's `[ValidateSet]` stays on the variable after binding
+
+`Add-LoggerSyslogSink` failed with "the value None is not a valid value for the Framing
+variable" when it later set `$Framing = 'None'` for UDP. Validation attributes on a parameter
+apply to every later assignment to that variable in the function, not only to binding. Put a
+derived value in a new variable (`$effectiveFraming`).
 
 ### `-f` (format) binds tighter than `+` (concatenation)
 
@@ -95,6 +133,37 @@ for *both* input and output, call `$inputCollection.Complete()` if there's genui
 and pass both to `BeginInvoke`. See the `Get-LoggerContent -Wait` test for the working pattern.
 
 ## Testing (Pester)
+
+### rsyslog asks every TLS client for a certificate, and refuses a missing one only after the handshake
+
+Found in the live test. A sender can't use "the server requested a client certificate" to
+tell whether one is required: rsyslog's GnuTLS driver sends a CertificateRequest on every TLS
+listener, including `authMode="anon"` ones. On an `x509/certvalid` listener, a client without
+a certificate completes the handshake, and rsyslog closes the connection only then
+("did not provide a certificate, not permitted to talk to it"). The client's next write
+succeeds locally and the message is lost. The reliable signal is the close itself: right after
+the handshake the socket is readable with nothing to read. `SyslogTransport` waits up to 100 ms
+for that close and treats it as a failed send.
+
+### `-WarningVariable` inside a `{ ... } | Should -Not -Throw` scriptblock is lost
+
+The scriptblock runs in a child scope, so a `-WarningVariable` set inside it is gone when the
+assertion after it runs. Call the command directly instead (a throw fails the test anyway),
+then assert on the variable.
+
+### `Should -BeLike` treats `[` and `]` as a wildcard character class
+
+Checking for an RFC 5424 structured-data element (`[test@32473 a="b"]`) with `-BeLike` never
+matched, because `[...]` is a wildcard set. Use `.EndsWith()`/`.Contains()`, or `-Match` with
+`[regex]::Escape()`.
+
+### A TLS server test needs a certificate whose key isn't ephemeral
+
+`CertificateRequest.CreateSelfSigned()` makes a certificate whose private key is ephemeral, and
+Schannel can't use that for `SslStream.AuthenticateAsServer`. Export it to a PFX and import it
+again (`X509Certificate2::new($pfxBytes, $password, 'Exportable')`). This works on 5.1 (.NET
+Framework 4.7.2 or later) and 7, and touches no certificate store. Run the server in a
+background runspace so the test thread can be the client. See the `Syslog sink: TLS` context.
 
 ### A variable set at the top of a test file, outside any block, isn't visible in `BeforeAll`/`It`
 

@@ -1,7 +1,7 @@
 # LogaPe
 
 Thread- and process-safe logging for PowerShell scripts: write to the console, a log file,
-and additional sinks (e.g. Windows Event Log), with configurable levels, rotation, structured
+and additional sinks (Windows Event Log, syslog), with configurable levels, rotation, structured
 (JSON) output, and masking of sensitive values. Concurrent writers to the same file are
 serialized with a named mutex so lines don't interleave or get lost.
 
@@ -9,8 +9,9 @@ Runs on Windows PowerShell 5.1 and PowerShell 7 (Windows), tested on 7.6.
 
 ## Features
 
-- Console, file, and pluggable sinks (Windows Event Log built in), each with its own minimum
-  level
+- Console, file, and pluggable sinks, each with its own minimum level: the Windows Event Log,
+  and syslog over UDP, TCP or TLS (RFC 5424/3164; TLS 1.2/1.3 with certificate validation,
+  pinning and mutual TLS)
 - Independent console/file logging levels
 - Size- and date-based log rotation, with retention/archive-count pruning
 - Text or structured JSON output, with a customizable message template

@@ -286,6 +286,12 @@ every destination and sink is scrubbed identically with no per-destination dupli
 covers `-ErrorRecord`/`-Exception` detail too since `Write-Log` folds those into the message
 before `Write()` is ever called.
 
+*Changed in 0.7.0 (§12):* masking moved out of `FormatMessage` into
+`Logger.GetMaskedRecord()`, which `_WriteOutput` calls once per write. It returns the masked
+message and fields separately, because the syslog sink needs them before text formatting.
+`FormatMessage` now receives values that are already masked. Masking still runs once per
+write, upstream of every destination.
+
 ### Two masking mechanisms
 
 - **`MaskRule`** (`Add-LoggerMaskRule`) — a case-insensitive .NET regex applied to the message
@@ -365,3 +371,118 @@ Three gaps identified in review, addressed in the same feature:
   arguments (`$SkipMasking`, defaulted to `$false` by every shorter overload) down through
   `_WriteOutput` to `FormatMessage`, where it short-circuits both the message-text and
   `-Fields` masking calls for that one write.
+
+## 12. Syslog sink (v0.7.0)
+
+`Add-LoggerSyslogSink` sends a logger's messages to a syslog collector. The plan, with the
+reasoning behind each choice and the answered questions, is
+[Archive_Planning_Syslog-Sink.md](Archive_Planning_Syslog-Sink.md). This section describes what was built.
+
+### Pieces
+
+| Piece | Role |
+|---|---|
+| `SyslogFormatter` (class) | Builds one message: RFC 5424 (default) or RFC 3164. No I/O. Maps levels to severities (Critical 2, Error 3, Warning 4, Information and None 6, Debug/Verbose/Trace 7), cleans header fields, builds structured data, adds a BOM to non-ASCII RFC 5424 bodies, and truncates at a UTF-8 character boundary with a `...[truncated]` marker. |
+| `SyslogTransport` (class) | Owns the socket: UDP (unconnected, so an ICMP port-unreachable never throws), TCP with octet-counting or LF framing, or TLS. Opens lazily, keeps the connection, detects a closed connection with `Socket.Poll` before sending, and backs off 1 s doubling to 60 s after a failure. A `Monitor` lock serializes sends. |
+| `LogaPe.SyslogCertificateValidator` (C#, `Add-Type`) | The TLS certificate validation and client certificate selection callbacks. Compiled on the first TLS connect, once per process. |
+| `LoggingSink.Transport` / `.Formatter` | Hidden members, so `Get-LoggerSink` shows only the plain `Config` settings. `LoggingSink.Dispose()` closes the transport; `RemoveSink` and `Logger.Close()` (`Remove-Logger`) call it. |
+| `Logger.WriteToSink` | A `Syslog` branch: format with the sink's formatter, then send. |
+
+### Message body
+
+Masking moved into `Logger.GetMaskedRecord()` (see §11), so the sink gets the masked message
+and fields separately. The syslog header already has the timestamp and severity, so the body is
+the message plus fields, in the logger's `Text` layout (`message | key=value, ...`) or `Json`
+layout (`{"Message":...,"key":...}`), without LogaPe's own timestamp and level. With
+`-StructuredDataId 'name@number'`, the fields go into RFC 5424 structured data instead, escaped
+as §6.3.3 requires.
+
+### TLS
+
+TLS 1.2 and 1.3 only (RFC 9662). TLS 1.3 is requested only where the `SslProtocols.Tls13` value
+exists, and the OS picks the version and cipher suite (Schannel prefers forward-secret AEAD
+suites). Validation is chain plus name by default, with revocation as an option.
+`-ServerCertificateThumbprint` pins SHA-256 fingerprints (RFC 5425 §5.2) instead: the handshake
+accepts any certificate, and the fingerprint is checked before any message is sent.
+`-ClientCertificate` provides mutual TLS. `-SkipCertificateCheck` accepts anything and warns
+when the sink is added.
+
+### Decisions made while building
+
+- **No static methods in the new classes.** A static method of a PowerShell class is bound to
+  the last runspace that imported the module. Once that runspace is gone, calling the method
+  throws `NullReferenceException`. The existing `Get-LoggerContent -Wait` test imports the
+  module in a background runspace and triggered exactly that. The formatter and transport use
+  instance methods only, and the shared `key=value` text is a module function
+  (`ConvertTo-LogFieldText`).
+- **C# for the certificate callbacks.** A scriptblock delegate needs a PowerShell runspace on
+  the calling thread and can deadlock. A compiled callback runs on any thread.
+- **Sink warnings are queued and emitted by `Write-Log`.** `Write-Warning` inside a class method
+  ignores the caller's `-WarningAction`, `-WarningVariable` and `$WarningPreference`. The
+  transport returns its warning text, the logger queues it (`PendingWarnings`, capped at 100),
+  and `Write-Log` writes it from its own context. The Event Log sink's per-write warning moved
+  to the same queue, so `-WarningAction SilentlyContinue` now silences it too.
+- **One warning per outage.** A failed send warns once and starts the backoff. Writes during the
+  backoff are dropped without trying. The first successful send afterwards warns again with
+  the number of dropped messages. An outage costs one timeout (`-TimeoutSeconds`, default 2),
+  not one per message.
+- **A collector that drops the client right after the TLS handshake is a failure.** rsyslog
+  checks a required client certificate only after the handshake, then closes the connection,
+  so the next write would vanish without an error. After each handshake the transport waits up
+  to 100 ms for that close. If it comes, the send fails with a warning that names the likely
+  cause (no client certificate, or a refused one). The alternative, asking whether the server
+  requested a certificate, doesn't work: rsyslog requests one from every TLS client, even on
+  a port that doesn't require it.
+- **TLS connections end with close_notify** (`SslStream.ShutdownAsync`) before the socket
+  closes, so the collector logs a clean close instead of a truncated connection.
+- **Sharing a logger across runspaces isn't supported.** PowerShell class instances have
+  affinity to the runspace that created them. The concurrency test gives each runspace its own
+  logger and sink, the same as the file concurrency test.
+
+### Test coverage
+
+`Tests/LogaPe.Tests.ps1` has three syslog contexts, 42 tests, all on loopback with no external
+collector:
+
+- **Message format.** The RFC 5424 header, PRI for each level and several facilities,
+  header-field cleaning and nil values, fields in the body in both `Text` and `Json`,
+  structured-data escaping, the BOM rule, truncation at a character boundary, the RFC 3164
+  layout and its 1024-byte cap, and LF framing.
+- **Delivery.** UDP, including the default app name; level filtering; masking in `Text`, `Json`
+  and structured-data bodies, and with `-SkipMasking`; TCP with octet-counting and LF framing;
+  a collector that's down (one warning, writes stay fast while backed off); recovery; closing
+  the socket on `Remove-LoggerSink` and `Remove-Logger`; the `Get-LoggerSink` listing;
+  parameter validation; and four runspaces logging concurrently.
+- **TLS.** An in-memory self-signed certificate and an `SslStream` server in a background
+  runspace. The tests check that default validation rejects the certificate, that
+  `-SkipCertificateCheck` accepts it (over TLS 1.2 or 1.3), that a matching pin accepts it and
+  a wrong pin rejects it, that a server closing the connection right after the handshake gives a
+  warning, and that mutual TLS presents the client certificate.
+
+`Examples/08-SyslogSink.ps1` sends to a local UDP listener, so the example tests cover it on
+both editions.
+
+### Live test (2026-10-12)
+
+Against a real collector: rsyslog 8.2510 on Rocky 9 (SELinux enforcing), deployed by LABaPe's
+**Syslog collector** catalog service. It listens on UDP and TCP 514, TLS on 6514, and TLS with a
+required client certificate on 6515, using a certificate from LABaPe's platform CA. The sender
+was this development machine (Windows 10), on Windows PowerShell 5.1 and PowerShell 7.6.6.
+
+| Case | Result (both editions) |
+|---|---|
+| UDP, RFC 5424, `local3`, Warning | Arrived as `local3.warning`, with app name, PID, MSGID and SD parsed |
+| UDP, RFC 3164, `local4`, Error | Arrived as `local4.err` with the TAG and PID parsed |
+| TCP, octet-counting, Critical | Arrived as `user.crit`, the line break intact (rsyslog shows it as `#012`) |
+| TCP, LF framing | Arrived; the line break became a space |
+| TLS, default validation | Refused, because the platform root isn't trusted on the sender: "a certificate chain could not be built to a trusted root authority" |
+| TLS, pinned SHA-256 fingerprint, structured data | Arrived; `[logape@32473 case="tlspin" api_token="***"]` parsed as structured data |
+| TLS, `-SkipCertificateCheck`, MSGID | Arrived with `msgid=SKIP` |
+| Mutual TLS, client certificate from the platform CA | Arrived |
+| Mutual TLS without a client certificate | Refused by the collector; LogaPe warns that the collector closed the connection after the handshake and probably requires a client certificate |
+
+Every case masked `password=` and `api_token` before sending. TLS negotiated 1.2: the Windows
+10 TLS client doesn't do TLS 1.3, which needs Windows 11 or Server 2022 or later, and the sink
+then uses 1.3 by itself. Plain TCP messages first arrived seconds late. The cause was the
+collector's reverse-DNS lookup of each new sender, not LogaPe, and LABaPe's collector role now
+turns it off.

@@ -9,10 +9,10 @@ No `Set-StrictMode` or `#Requires` is used anywhere
 in the module, tests, or examples, so strict mode is not enabled.
 
 ## Folder map
-- `LogaPe/` — the module: `LogaPe.psd1` (manifest) and `LogaPe.psm1` (all code — classes, private helpers, public functions in one 2706-line file by design, see Claude_Docs/Design_Architecture.md §10). Over 1,000 lines: grep for the function/class name and read a line range; don't read the whole file.
-- `Tests/` — Pester tests: `LogaPe.Tests.ps1` (492 lines) and `Examples.Tests.ps1` (49 lines, smoke-tests each `Examples/*.ps1` script as its own PS 5.1 subprocess, and as a PS 7 subprocess when one is found).
-- `Examples/` — runnable, smoke-tested usage scripts (`01-GettingStarted.ps1` … `07-EventLogSink.ps1`) plus a `README.md` index.
-- `Claude_Docs/Design_Architecture.md` — design doc; §1-9 the original module rewrite, §10 what actually shipped, §11 the masking feature (v0.5.0).
+- `LogaPe/` — the module: `LogaPe.psd1` (manifest) and `LogaPe.psm1` (all code — classes, private helpers, public functions in one ~3,900-line file by design, see Claude_Docs/Design_Architecture.md §10). Over 1,000 lines: grep for the function/class name and read a line range; don't read the whole file.
+- `Tests/` — Pester tests: `LogaPe.Tests.ps1` (~1,200 lines) and `Examples.Tests.ps1` (50 lines, smoke-tests each `Examples/*.ps1` script as its own PS 5.1 subprocess, and as a PS 7 subprocess when one is found).
+- `Examples/` — runnable, smoke-tested usage scripts (`01-GettingStarted.ps1` … `08-SyslogSink.ps1`) plus a `README.md` index.
+- `Claude_Docs/Design_Architecture.md` — design doc; §1-9 the original module rewrite, §10 what actually shipped, §11 the masking feature (v0.5.0), §12 the syslog sink (v0.7.0).
 - `CHANGELOG.md` — version history, `[Unreleased]` at top. Kept at repo root (not in `Claude_Docs/`) — standard tooling/GitHub convention for finding a changelog.
 - `User_Docs/Usage.md` — usage guide; includes "Masking sensitive values" and a function reference.
 - `Claude_Docs/Reference_Lessons-Learned.md` — categorized bug/gotcha log: PowerShell Classes, PowerShell Language Gotchas, Testing (Pester), PSScriptAnalyzer/Linting, Design bugs.
@@ -42,7 +42,8 @@ in the module, tests, or examples, so strict mode is not enabled.
 - `Claude_Docs/` holds every doc Claude creates or works from, named `<Stage>_<Topic-With-Hyphens>.md`:
   - `Design_Architecture.md`: how the current (shipped) module works, in numbered sections. Keep current.
   - `Reference_Lessons-Learned.md`: categorized gotchas/bugs, filed by category, never deleted — matches `Reference_`'s own definition (conventions/lessons/interface contracts).
-  - No `Planning_`/`Archive_` docs exist yet.
+  - `Archive_Planning_Syslog-Sink.md`: the syslog sink plan and its answered questions (built and live-tested; what shipped is Design_Architecture.md §12).
+  - `Planning_Questions.md`: open questions waiting on the user, numbered (never renumbered; new ones continue from the highest). Move answered ones to its "Answered" section.
 - `User_Docs/Usage.md`: end-user usage guide and function reference for people consuming the module.
 - `CHANGELOG.md` (root): version history, newest/`[Unreleased]` at top. Kept at root rather than moved into `Claude_Docs/` — standard tooling/GitHub convention.
 - Rename docs with `git mv`, and update every link to them in the same change.

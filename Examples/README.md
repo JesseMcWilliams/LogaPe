@@ -20,6 +20,7 @@ Run any of them directly, e.g.:
 | [05-ExceptionHandling.ps1](05-ExceptionHandling.ps1) | `-ErrorRecord` and `-Exception` on `Write-Log` |
 | [06-TailingTheLog.ps1](06-TailingTheLog.ps1) | `Get-LoggerContent`, including `-Tail` (and where `-Wait` fits in) |
 | [07-EventLogSink.ps1](07-EventLogSink.ps1) | Adding/removing a Windows Event Log sink with its own level |
+| [08-SyslogSink.ps1](08-SyslogSink.ps1) | Sending to a syslog collector (a local UDP listener stands in for one), facility, level filtering and masking |
 
 These are examples first - they're written to be read, not just run. They're also smoke-tested
 by [`Tests/Examples.Tests.ps1`](../Tests/Examples.Tests.ps1), which just runs each one and
