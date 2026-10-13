@@ -5,6 +5,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-12
+
 ### Added
 - Syslog sink: `Add-LoggerSyslogSink` sends messages to a syslog collector over UDP (RFC 5426),
   TCP (RFC 6587, octet-counting or LF framing) or TLS (RFC 5425). Messages are RFC 5424 by

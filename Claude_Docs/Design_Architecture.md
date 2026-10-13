@@ -1,8 +1,9 @@
 # LogaPe — Design Document
 
-Status: **Implemented** (v0.1.0 through v0.6.0). §1-9 cover the original module rewrite; §10
+Status: **Implemented** (v0.1.0 through v0.7.0). §1-9 cover the original module rewrite; §10
 records what shipped for that rewrite. §11 covers the masking feature added in v0.5.0.
-v0.6.0 added PowerShell 7 support (§3) and a FIPS-safe mutex name.
+v0.6.0 added PowerShell 7 support (§3) and a FIPS-safe mutex name. §12 covers the syslog sink
+added in v0.7.0.
 
 ## 1. Purpose
 
