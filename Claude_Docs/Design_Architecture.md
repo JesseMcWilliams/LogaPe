@@ -376,7 +376,7 @@ Three gaps identified in review, addressed in the same feature:
 
 `Add-LoggerSyslogSink` sends a logger's messages to a syslog collector. The plan, with the
 reasoning behind each choice and the answered questions, is
-[Planning_Syslog-Sink.md](Planning_Syslog-Sink.md). This section describes what was built.
+[Archive_Planning_Syslog-Sink.md](Archive_Planning_Syslog-Sink.md). This section describes what was built.
 
 ### Pieces
 
@@ -426,13 +426,22 @@ when the sink is added.
   backoff are dropped without trying. The first successful send afterwards warns again with
   the number of dropped messages. An outage costs one timeout (`-TimeoutSeconds`, default 2),
   not one per message.
+- **A collector that drops the client right after the TLS handshake is a failure.** rsyslog
+  checks a required client certificate only after the handshake, then closes the connection,
+  so the next write would vanish without an error. After each handshake the transport waits up
+  to 100 ms for that close. If it comes, the send fails with a warning that names the likely
+  cause (no client certificate, or a refused one). The alternative, asking whether the server
+  requested a certificate, doesn't work: rsyslog requests one from every TLS client, even on
+  a port that doesn't require it.
+- **TLS connections end with close_notify** (`SslStream.ShutdownAsync`) before the socket
+  closes, so the collector logs a clean close instead of a truncated connection.
 - **Sharing a logger across runspaces isn't supported.** PowerShell class instances have
   affinity to the runspace that created them. The concurrency test gives each runspace its own
   logger and sink, the same as the file concurrency test.
 
 ### Test coverage
 
-`Tests/LogaPe.Tests.ps1` has three syslog contexts, 41 tests, all on loopback with no external
+`Tests/LogaPe.Tests.ps1` has three syslog contexts, 42 tests, all on loopback with no external
 collector:
 
 - **Message format.** The RFC 5424 header, PRI for each level and several facilities,
@@ -447,7 +456,33 @@ collector:
 - **TLS.** An in-memory self-signed certificate and an `SslStream` server in a background
   runspace. The tests check that default validation rejects the certificate, that
   `-SkipCertificateCheck` accepts it (over TLS 1.2 or 1.3), that a matching pin accepts it and
-  a wrong pin rejects it, and that mutual TLS presents the client certificate.
+  a wrong pin rejects it, that a server closing the connection right after the handshake gives a
+  warning, and that mutual TLS presents the client certificate.
 
 `Examples/08-SyslogSink.ps1` sends to a local UDP listener, so the example tests cover it on
 both editions.
+
+### Live test (2026-10-12)
+
+Against a real collector: rsyslog 8.2510 on Rocky 9 (SELinux enforcing), deployed by LABaPe's
+**Syslog collector** catalog service. It listens on UDP and TCP 514, TLS on 6514, and TLS with a
+required client certificate on 6515, using a certificate from LABaPe's platform CA. The sender
+was this development machine (Windows 10), on Windows PowerShell 5.1 and PowerShell 7.6.6.
+
+| Case | Result (both editions) |
+|---|---|
+| UDP, RFC 5424, `local3`, Warning | Arrived as `local3.warning`, with app name, PID, MSGID and SD parsed |
+| UDP, RFC 3164, `local4`, Error | Arrived as `local4.err` with the TAG and PID parsed |
+| TCP, octet-counting, Critical | Arrived as `user.crit`, the line break intact (rsyslog shows it as `#012`) |
+| TCP, LF framing | Arrived; the line break became a space |
+| TLS, default validation | Refused, because the platform root isn't trusted on the sender: "a certificate chain could not be built to a trusted root authority" |
+| TLS, pinned SHA-256 fingerprint, structured data | Arrived; `[logape@32473 case="tlspin" api_token="***"]` parsed as structured data |
+| TLS, `-SkipCertificateCheck`, MSGID | Arrived with `msgid=SKIP` |
+| Mutual TLS, client certificate from the platform CA | Arrived |
+| Mutual TLS without a client certificate | Refused by the collector; LogaPe warns that the collector closed the connection after the handshake and probably requires a client certificate |
+
+Every case masked `password=` and `api_token` before sending. TLS negotiated 1.2: the Windows
+10 TLS client doesn't do TLS 1.3, which needs Windows 11 or Server 2022 or later, and the sink
+then uses 1.3 by itself. Plain TCP messages first arrived seconds late. The cause was the
+collector's reverse-DNS lookup of each new sender, not LogaPe, and LABaPe's collector role now
+turns it off.

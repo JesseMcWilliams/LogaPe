@@ -208,6 +208,12 @@ Add-LoggerSyslogSink -Server 'syslog.example.com' -Protocol Tls -CheckCertificat
 
 `-SkipCertificateCheck` accepts any certificate. It's for labs only, and adding the sink warns.
 
+If a collector requires a client certificate and you give none (or it refuses yours), it
+closes the connection right after the handshake. The sink treats that as a failed send and
+warns that the collector probably requires a client certificate. TLS 1.3 is used where the
+OS's TLS client supports it (Windows 11 and Server 2022 or later); Windows 10 and older
+servers use TLS 1.2.
+
 **When the collector is unreachable.** Nothing connects until the first message at or above
 `-Level`; the connection then stays open and reconnects if the collector restarts. If a send
 fails, the sink warns once, then drops messages without trying while it backs off (1 s,

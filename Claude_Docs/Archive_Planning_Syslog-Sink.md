@@ -1,17 +1,15 @@
 # Plan: Syslog sink
 
-> **Stage: Planning.** Proposed design for sending LogaPe output to a syslog server. Nothing here
-> is implemented yet. Once it ships, move the design into a new numbered section of
-> `Design_Architecture.md` and rename this file `Archive_Planning_Syslog-Sink.md`.
+> **Stage: Archive.** The plan for sending LogaPe output to a syslog server, kept for its
+> reasoning and answered questions. It was built and live-tested on 2026-10-12. What shipped,
+> including changes made while building, is `Design_Architecture.md` §12.
 
 Status: **Final, 2026-10-12.** Questions 1–7 are answered (§9): every *(proposed)* choice was
 accepted, and the user asked for current best practice throughout, which added §3.2's TLS
 requirements (RFC 9662, mutual TLS, certificate pinning). The live test runs against a collector
 VM deployed by LABaPe (§6).
 
-Progress: phases 1–6 (§7) are built and tested on loopback on both editions; what shipped is
-in `Design_Architecture.md` §12. Phase 7 (the lab live test) is next. Archive this plan once it
-passes.
+Progress: all phases (§7) are done, including the lab live test (`Design_Architecture.md` §12).
 
 ## 1. Goal
 

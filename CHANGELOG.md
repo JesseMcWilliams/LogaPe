@@ -20,7 +20,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/), versioni
 - A syslog collector that's down never throws into your script and never stalls every write:
   the sink warns once, backs off (1 s doubling to 60 s) while dropping messages, and warns again
   with the dropped count when the collector is back. `Remove-LoggerSink` and `Remove-Logger`
-  close the connection.
+  close the connection, ending TLS with close_notify.
+- A TLS collector that drops the connection right after the handshake (rsyslog does this
+  when it requires a client certificate and none, or a refused one, is given) is reported as a
+  failed send with the likely cause, instead of messages vanishing silently.
 - `Examples/08-SyslogSink.ps1`.
 
 ### Fixed

@@ -788,12 +788,12 @@ Describe 'LogaPe' {
             # Starts a one-connection TLS server; Stop-TestTlsServer returns what it saw.
             function Start-TestTlsServer
             {
-                param($Certificate, [switch]$RequireClientCertificate)
+                param($Certificate, [switch]$RequireClientCertificate, [switch]$CloseAfterHandshake)
                 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
                 $listener.Start()
                 $ps = [powershell]::Create()
                 [void]$ps.AddScript({
-                        param($Listener, $Certificate, $RequireClient)
+                        param($Listener, $Certificate, $RequireClient, $CloseAfterHandshake)
                         $result = @{ Error = $null; Protocol = $null; ClientFingerprint = $null; Frame = $null }
                         $accept = $Listener.AcceptTcpClientAsync()
                         if (-not $accept.Wait(15000)) { $result.Error = 'no connection'; return $result }
@@ -809,6 +809,8 @@ Describe 'LogaPe' {
                             }
                             $ssl.AuthenticateAsServer($Certificate, [bool]$RequireClient, $protocols, $false)
                             $result.Protocol = $ssl.SslProtocol.ToString()
+                            # Like rsyslog refusing a client after the handshake.
+                            if ($CloseAfterHandshake) { return $result }
                             if ($ssl.RemoteCertificate)
                             {
                                 $sha = [System.Security.Cryptography.SHA256CryptoServiceProvider]::new()
@@ -835,7 +837,7 @@ Describe 'LogaPe' {
                             $client.Dispose()
                         }
                         return $result
-                    }).AddArgument($listener).AddArgument($Certificate).AddArgument($RequireClientCertificate.IsPresent)
+                    }).AddArgument($listener).AddArgument($Certificate).AddArgument($RequireClientCertificate.IsPresent).AddArgument($CloseAfterHandshake.IsPresent)
                 return [pscustomobject]@{ Listener = $listener; PowerShell = $ps; Handle = $ps.BeginInvoke(); Port = $listener.LocalEndpoint.Port }
             }
 
@@ -881,11 +883,12 @@ Describe 'LogaPe' {
             $logger = New-Logger -Folder $script:LogFolder -FileName 'syslog-tls-skip.log' -UseFileNameAsIs -Destination File
             Add-LoggerSyslogSink -Server localhost -Port $server.Port -Protocol Tls -SkipCertificateCheck -TimeoutSeconds 10 -Level Information -Logger $logger -WarningVariable addWarnings -WarningAction SilentlyContinue | Out-Null
 
-            Write-Log 'over tls' -Logger $logger
+            Write-Log 'over tls' -Logger $logger -WarningVariable writeWarnings
             $result = Stop-TestTlsServer $server
             Remove-Logger -Logger $logger -Confirm:$false
 
             "$addWarnings" | Should -Match 'accepts any server certificate'
+            $writeWarnings | Should -BeNullOrEmpty
             $result.Error | Should -BeNullOrEmpty
             $result.Protocol | Should -BeIn @('Tls12', 'Tls13')
             $result.Frame | Should -Match ' - - over tls$'
@@ -908,6 +911,20 @@ Describe 'LogaPe' {
             Remove-Logger -Logger $logger -Confirm:$false
             $result = Stop-TestTlsServer $server
             "$pinWarnings" | Should -Match 'fingerprint'
+            $result.Frame | Should -BeNullOrEmpty
+        }
+
+        It 'warns when the server closes the connection right after the handshake (e.g. no client certificate)' {
+            $server = Start-TestTlsServer -Certificate $script:ServerCertificate -RequireClientCertificate -CloseAfterHandshake
+            $logger = New-Logger -Folder $script:LogFolder -FileName 'syslog-tls-nocert.log' -UseFileNameAsIs -Destination File
+            Add-LoggerSyslogSink -Server localhost -Port $server.Port -Protocol Tls -ServerCertificateThumbprint $script:ServerFingerprint -TimeoutSeconds 10 -Level Information -Logger $logger | Out-Null
+
+            Write-Log 'no client cert' -Logger $logger -WarningVariable +certWarnings -WarningAction SilentlyContinue
+            $result = Stop-TestTlsServer $server
+            Remove-Logger -Logger $logger -Confirm:$false
+
+            @($certWarnings).Count | Should -Be 1
+            "$certWarnings" | Should -Match 'closed the connection right after the TLS handshake; it probably requires a client certificate'
             $result.Frame | Should -BeNullOrEmpty
         }
 

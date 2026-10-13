@@ -42,7 +42,7 @@ in the module, tests, or examples, so strict mode is not enabled.
 - `Claude_Docs/` holds every doc Claude creates or works from, named `<Stage>_<Topic-With-Hyphens>.md`:
   - `Design_Architecture.md`: how the current (shipped) module works, in numbered sections. Keep current.
   - `Reference_Lessons-Learned.md`: categorized gotchas/bugs, filed by category, never deleted — matches `Reference_`'s own definition (conventions/lessons/interface contracts).
-  - `Planning_Syslog-Sink.md`: the syslog sink plan (final; built, see Design_Architecture.md §12). Rename to `Archive_Planning_Syslog-Sink.md` once the lab live test passes and it ships.
+  - `Archive_Planning_Syslog-Sink.md`: the syslog sink plan and its answered questions (built and live-tested; what shipped is Design_Architecture.md §12).
   - `Planning_Questions.md`: open questions waiting on the user, numbered (never renumbered; new ones continue from the highest). Move answered ones to its "Answered" section.
 - `User_Docs/Usage.md`: end-user usage guide and function reference for people consuming the module.
 - `CHANGELOG.md` (root): version history, newest/`[Unreleased]` at top. Kept at root rather than moved into `Claude_Docs/` — standard tooling/GitHub convention.

@@ -134,6 +134,17 @@ and pass both to `BeginInvoke`. See the `Get-LoggerContent -Wait` test for the w
 
 ## Testing (Pester)
 
+### rsyslog asks every TLS client for a certificate, and refuses a missing one only after the handshake
+
+Found in the live test. A sender can't use "the server requested a client certificate" to
+tell whether one is required: rsyslog's GnuTLS driver sends a CertificateRequest on every TLS
+listener, including `authMode="anon"` ones. On an `x509/certvalid` listener, a client without
+a certificate completes the handshake, and rsyslog closes the connection only then
+("did not provide a certificate, not permitted to talk to it"). The client's next write
+succeeds locally and the message is lost. The reliable signal is the close itself: right after
+the handshake the socket is readable with nothing to read. `SyslogTransport` waits up to 100 ms
+for that close and treats it as a failed send.
+
 ### `-WarningVariable` inside a `{ ... } | Should -Not -Throw` scriptblock is lost
 
 The scriptblock runs in a child scope, so a `-WarningVariable` set inside it is gone when the

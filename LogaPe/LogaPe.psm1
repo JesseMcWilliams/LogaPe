@@ -676,6 +676,21 @@ class SyslogTransport
                 throw ("the server certificate's SHA-256 fingerprint {0} matches no -ServerCertificateThumbprint value" -f $fingerprint)
             }
         }
+
+        # A collector that rejects the client after the handshake (rsyslog checks the client
+        # certificate only then) closes the connection at once; the next write would vanish
+        # without an error. Catch that here, so it becomes a warning and a backoff. Asking
+        # whether a certificate was requested doesn't work: rsyslog asks every client.
+        $socket = $this.Tcp.Client
+        if ($socket.Poll(100000, [System.Net.Sockets.SelectMode]::SelectRead) -and $socket.Available -eq 0)
+        {
+            $ssl.Dispose()
+            if ($null -eq $this.ClientCertificate)
+            {
+                throw 'the collector closed the connection right after the TLS handshake; it probably requires a client certificate (-ClientCertificate)'
+            }
+            throw 'the collector closed the connection right after the TLS handshake; it probably refused the client certificate'
+        }
         return $ssl
     }
 
@@ -703,6 +718,12 @@ class SyslogTransport
 
     hidden [void]CloseConnection()
     {
+        if ($this.Stream -is [System.Net.Security.SslStream])
+        {
+            # TLS close_notify, so the collector sees a clean close rather than a truncated
+            # connection (rsyslog logs "non-properly terminated" otherwise).
+            try { [void]$this.Stream.ShutdownAsync().Wait($this.TimeoutMs) } catch { Write-Debug "Syslog TLS shutdown failed: $($_.Exception.Message)" }
+        }
         if ($null -ne $this.Stream)
         {
             try { $this.Stream.Dispose() } catch { Write-Debug "Syslog stream dispose failed: $($_.Exception.Message)" }
@@ -1727,6 +1748,7 @@ namespace LogaPe
         // Why the last certificate was rejected, for the sink's warning.
         public string LastError;
 
+
         public SyslogCertificateValidator(bool acceptAny, X509Certificate clientCertificate)
         {
             _acceptAny = acceptAny;
@@ -1766,7 +1788,7 @@ namespace LogaPe
                 }
                 reasons.Append("; ");
             }
-            LastError = "the server certificate was rejected: " + reasons.ToString().TrimEnd(' ', ';');
+            LastError = "the server certificate was rejected: " + reasons.ToString().TrimEnd(' ', ';', '.');
             return false;
         }
 

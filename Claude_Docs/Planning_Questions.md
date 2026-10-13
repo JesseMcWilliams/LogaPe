@@ -12,7 +12,7 @@ None open. New questions continue from 8.
 
 ## Answered
 
-All from [Planning_Syslog-Sink.md](Planning_Syslog-Sink.md) §9, answered 2026-10-12. The user
+All from [Archive_Planning_Syslog-Sink.md](Archive_Planning_Syslog-Sink.md) §9, answered 2026-10-12. The user
 also asked for current best practice throughout (recorded in that plan's §3.2).
 
 1. **Transports in v1:** UDP, TCP and TLS, with mutual TLS included.
